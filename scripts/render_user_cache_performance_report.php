@@ -7,8 +7,8 @@ final class UcPerformanceReport
 	private ?string $cliReadPath = null;
 	private ?string $cliWritePath = null;
 	private ?string $residentPath = null;
-	private ?string $fpmOncePath = null;
-	private ?string $fpmHotPath = null;
+	private array $fpmOncePaths = [];
+	private array $fpmHotPaths = [];
 	private array $bulkPaths = [];
 	private string $output;
 
@@ -24,19 +24,19 @@ final class UcPerformanceReport
 		$cliRead = $this->cliReadPath !== null ? $this->readJson($this->cliReadPath) : null;
 		$cliWrite = $this->cliWritePath !== null ? $this->readJson($this->cliWritePath) : null;
 		$resident = $this->residentPath !== null ? $this->readJson($this->residentPath) : null;
-		$fpmOnce = $this->fpmOncePath !== null ? $this->readJson($this->fpmOncePath) : null;
-		$fpmHot = $this->fpmHotPath !== null ? $this->readJson($this->fpmHotPath) : null;
+		$fpmOnceRuns = $this->readFpmRuns($this->fpmOncePaths);
+		$fpmHotRuns = $this->readFpmRuns($this->fpmHotPaths);
 		$bulkRuns = array_map(fn (string $path): array => ['path' => $path, 'data' => $this->readJson($path)], $this->bulkPaths);
 
 		if ($cliWrite === null && $cliRead !== null && ($cliRead['write'] ?? []) !== []) {
 			$cliWrite = $cliRead;
 		}
 
-		if ($cliRead === null && $cliWrite === null && $resident === null && $fpmOnce === null && $fpmHot === null && $bulkRuns === []) {
+		if ($cliRead === null && $cliWrite === null && $resident === null && $fpmOnceRuns === [] && $fpmHotRuns === [] && $bulkRuns === []) {
 			throw new RuntimeException('No benchmark result files were provided');
 		}
 
-		$html = $this->render($cliRead, $cliWrite, $resident, $fpmOnce, $fpmHot, $bulkRuns);
+		$html = $this->render($cliRead, $cliWrite, $resident, $fpmOnceRuns, $fpmHotRuns, $bulkRuns);
 		$dir = dirname($this->output);
 		if (!is_dir($dir) && !mkdir($dir, 0777, true) && !is_dir($dir)) {
 			throw new RuntimeException('Unable to create output directory: ' . $dir);
@@ -62,10 +62,10 @@ final class UcPerformanceReport
 					$this->residentPath = $this->absolutePath($this->value($argv, ++$i, $arg));
 					break;
 				case '--fpm-once':
-					$this->fpmOncePath = $this->absolutePath($this->value($argv, ++$i, $arg));
+					$this->fpmOncePaths[] = $this->absolutePath($this->value($argv, ++$i, $arg));
 					break;
 				case '--fpm-hot':
-					$this->fpmHotPath = $this->absolutePath($this->value($argv, ++$i, $arg));
+					$this->fpmHotPaths[] = $this->absolutePath($this->value($argv, ++$i, $arg));
 					break;
 				case '--bulk':
 					$this->bulkPaths[] = $this->absolutePath($this->value($argv, ++$i, $arg));
@@ -88,20 +88,35 @@ final class UcPerformanceReport
 		fwrite(STDOUT, "Usage: php scripts/render_user_cache_performance_report.php [--cli-read FILE] [--cli-write FILE] [--resident FILE] [--fpm-once FILE] [--fpm-hot FILE] [--bulk FILE]... [--output FILE]\n");
 	}
 
-	private function render(?array $cliRead, ?array $cliWrite, ?array $resident, ?array $fpmOnce, ?array $fpmHot, array $bulkRuns): string
+	private function readFpmRuns(array $paths): array
+	{
+		$runs = [];
+		foreach ($paths as $index => $path) {
+			$data = $this->readJson($path);
+			$runs[] = [
+				'path' => $path,
+				'label' => $this->fpmRunLabel($data, $index),
+				'data' => $data,
+			];
+		}
+
+		return $runs;
+	}
+
+	private function render(?array $cliRead, ?array $cliWrite, ?array $resident, array $fpmOnceRuns, array $fpmHotRuns, array $bulkRuns): string
 	{
 		$cards = [];
 		if ($cliRead !== null) {
-			$cards[] = $this->winnerCard('CLI repeated read', $cliRead['read'] ?? [], 'mean_operation_us');
+			$cards[] = $this->winnerCard('CLI repeated read', $cliRead['read'] ?? [], 'median_us');
 		}
 		if ($cliWrite !== null && ($cliWrite['write'] ?? []) !== []) {
-			$cards[] = $this->winnerCard('CLI store', $cliWrite['write'] ?? [], 'mean_store_us');
+			$cards[] = $this->winnerCard('CLI store', $cliWrite['write'] ?? [], 'median_us');
 		}
-		if ($fpmOnce !== null) {
-			$cards[] = $this->winnerCard('FPM one fetch/request', $fpmOnce['results'] ?? [], 'mean_server_us_per_op');
+		foreach ($fpmOnceRuns as $run) {
+			$cards[] = $this->winnerCard('FPM one fetch/request (' . $run['label'] . ')', $run['data']['results'] ?? [], 'median_server_us_per_op');
 		}
-		if ($fpmHot !== null) {
-			$cards[] = $this->winnerCard('FPM hot read', $fpmHot['results'] ?? [], 'mean_server_us_per_op');
+		foreach ($fpmHotRuns as $run) {
+			$cards[] = $this->winnerCard('FPM hot read (' . $run['label'] . ')', $run['data']['results'] ?? [], 'median_server_us_per_op');
 		}
 		return '<!doctype html>
 <html lang="en">
@@ -171,6 +186,24 @@ p {
   line-height: 1.25;
   overflow-wrap: anywhere;
   word-break: break-word;
+}
+.ratio-list {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 12px;
+  margin: 10px 0 0;
+  font-variant-numeric: tabular-nums;
+}
+.ratio-list dt,
+.ratio-list dd {
+  margin: 0;
+}
+.ratio-list dt {
+  color: var(--muted);
+}
+.ratio-list dd {
+  text-align: right;
+  font-weight: 650;
 }
 .note {
   border: 1px solid var(--line);
@@ -248,15 +281,15 @@ code {
 <h1>OPcache User Cache Performance Report</h1>
 <p>Generated at <code>' . self::h(gmdate(DATE_ATOM)) . '</code>. Times are in microseconds; lower is faster.</p>
 <div class="cards">' . implode('', $cards) . '</div>
-' . $this->environmentSection($cliRead, $fpmOnce, $fpmHot) . '
-' . ($cliRead !== null ? $this->cacheReadTable('CLI Repeated Read', $cliRead['read'] ?? [], 'mean_operation_us', 'median_us') : '') . '
-' . ($cliWrite !== null ? $this->cacheReadTable('CLI Store', $cliWrite['write'] ?? [], 'mean_store_us', 'median_us', false, 'store-tradeoff-note') : '') . '
-' . ($fpmOnce !== null ? $this->cacheReadTable('FPM One Fetch Per Request', $fpmOnce['results'] ?? [], 'mean_server_us_per_op', 'median_server_us_per_op', true) : '') . '
-' . ($fpmHot !== null ? $this->cacheReadTable('FPM Hot Read', $fpmHot['results'] ?? [], 'mean_server_us_per_op', 'median_server_us_per_op', true) : '') . '
+' . $this->environmentSection($cliRead, $fpmOnceRuns, $fpmHotRuns) . '
+' . ($cliRead !== null ? $this->cacheReadTable('CLI Repeated Read', $cliRead['read'] ?? [], 'median_us', 'mean_operation_us', false, null, 'mean') : '') . '
+' . ($cliWrite !== null ? $this->cacheReadTable('CLI Store', $cliWrite['write'] ?? [], 'median_us', 'mean_store_us', false, 'store-tradeoff-note', 'mean') : '') . '
+' . $this->fpmTables('FPM One Fetch Per Request', $fpmOnceRuns) . '
+' . $this->fpmTables('FPM Hot Read', $fpmHotRuns) . '
 ' . $this->residentTable($resident, $cliRead) . '
 ' . $this->bulkTables($bulkRuns) . '
 ' . $this->artifactTable() . '
-' . $this->workloadsSection($cliRead, $cliWrite, $resident, $fpmOnce, $fpmHot, $bulkRuns) . '
+' . $this->workloadsSection($cliRead, $cliWrite, $resident, $fpmOnceRuns, $fpmHotRuns, $bulkRuns) . '
 ' . $this->notesSection() . '
 </main>
 </body>
@@ -264,9 +297,12 @@ code {
 ';
 	}
 
-	private function environmentSection(?array $cliRead, ?array $fpmOnce, ?array $fpmHot): string
+	private function environmentSection(?array $cliRead, array $fpmOnceRuns, array $fpmHotRuns): string
 	{
-		$environment = $cliRead['environment'] ?? $fpmOnce['environment'] ?? $fpmHot['environment'] ?? null;
+		$environment = $cliRead['environment']
+			?? $fpmOnceRuns[0]['data']['environment']
+			?? $fpmHotRuns[0]['data']['environment']
+			?? null;
 		if (!is_array($environment)) {
 			return '';
 		}
@@ -305,53 +341,106 @@ code {
 		$groups = $this->groupRows($rows);
 		$total = count($groups);
 		$userWins = 0;
-		$speedups = [];
 		foreach ($groups as $caseRows) {
 			$best = $this->bestBackend($caseRows, $metric);
 			if ($best === 'user_cache') {
 				$userWins++;
 			}
-			if (isset($caseRows['user_cache'], $caseRows['apcu'])) {
-				$user = (float) $caseRows['user_cache'][$metric];
-				$apcu = (float) $caseRows['apcu'][$metric];
-				if ($user > 0.0) {
-					$speedups[] = $apcu / $user;
-				}
-			}
 		}
-		$medianSpeedup = $speedups !== [] ? $this->median($speedups) : null;
 
 		return '<div class="card">' . self::h($title)
 			. '<strong>' . self::h((string) $userWins) . '/' . self::h((string) $total) . ' UserCache wins</strong>'
-			. '<span class="small">Median APCu/UserCache: ' . ($medianSpeedup !== null ? self::h($this->number($medianSpeedup, 2) . 'x') : 'n/a') . '</span></div>';
+			. $this->backendRatioList($groups, $rows, $metric)
+			. '</div>';
 	}
 
-	private function cacheReadTable(string $title, array $rows, string $metric, string $medianMetric, bool $showWorkers = false, ?string $apcuLossAnchor = null): string
+	private function backendRatioList(array $groups, array $rows, string $metric): string
+	{
+		$ratios = [
+			'user_cache' => [
+				'ratio' => 1.0,
+				'count' => count(array_filter($groups, static fn (array $caseRows): bool => isset($caseRows['user_cache'][$metric]))),
+			],
+		];
+
+		foreach ($this->backendOrderForRows($rows) as $backendName) {
+			if ($backendName === 'user_cache') {
+				continue;
+			}
+
+			$values = [];
+			foreach ($groups as $caseRows) {
+				if (!isset($caseRows['user_cache'][$metric], $caseRows[$backendName][$metric])) {
+					continue;
+				}
+
+				$userValue = (float) $caseRows['user_cache'][$metric];
+				$backendValue = (float) $caseRows[$backendName][$metric];
+				if ($userValue > 0.0 && $backendValue > 0.0) {
+					$values[] = $userValue / $backendValue;
+				}
+			}
+
+			if ($values !== []) {
+				$ratios[$backendName] = [
+					'ratio' => $this->median($values),
+					'count' => count($values),
+				];
+			}
+		}
+
+		$userRatio = ['user_cache' => $ratios['user_cache']];
+		unset($ratios['user_cache']);
+		uksort($ratios, function (string $a, string $b) use ($ratios): int {
+			$ratioCompare = $ratios[$b]['ratio'] <=> $ratios[$a]['ratio'];
+			if ($ratioCompare !== 0) {
+				return $ratioCompare;
+			}
+
+			return $this->backendLabel($a) <=> $this->backendLabel($b);
+		});
+
+		$html = '<dl class="ratio-list">';
+		foreach ($userRatio + $ratios as $backendName => $ratio) {
+			$count = (int) $ratio['count'];
+			$countSuffix = $count > 0 && $count !== count($groups) ? ' / ' . $count . ' cases' : '';
+			$html .= '<dt>' . self::h($this->backendLabel($backendName)) . '</dt>'
+				. '<dd>' . self::h($this->number((float) $ratio['ratio'], 2) . 'x' . $countSuffix) . '</dd>';
+		}
+
+		return $html . '</dl>';
+	}
+
+	private function cacheReadTable(string $title, array $rows, string $metric, string $secondaryMetric, bool $showWorkers = false, ?string $apcuLossAnchor = null, string $secondaryLabel = 'median'): string
 	{
 		$groups = $this->groupRows($rows);
 		if ($groups === []) {
 			return '<h2>' . self::h($title) . '</h2><p class="note">No rows measured.</p>';
 		}
 
-		$html = '<h2>' . self::h($title) . '</h2><table><thead><tr>'
-			. '<th>Workload</th><th class="num">UserCache</th><th class="num">APCu</th><th class="num">DeepClone</th><th class="num">APCu/UserCache</th>'
+		$backendNames = $this->backendOrderForRows($rows);
+		$html = '<h2>' . self::h($title) . '</h2><table><thead><tr><th>Workload</th>';
+		foreach ($backendNames as $backendName) {
+			$html .= '<th class="num">' . self::h($this->backendLabel($backendName)) . '</th>';
+		}
+		$html .= '<th class="num">Faster/UserCache</th>'
 			. ($showWorkers ? '<th class="num">Workers</th>' : '')
 			. '</tr></thead><tbody>';
 
 		foreach ($groups as $case => $caseRows) {
 			$bestBackend = $this->bestBackend($caseRows, $metric);
 			$user = isset($caseRows['user_cache']) ? (float) $caseRows['user_cache'][$metric] : null;
-			$apcu = isset($caseRows['apcu']) ? (float) $caseRows['apcu'][$metric] : null;
-			$speedup = $user !== null && $user > 0.0 && $apcu !== null ? $apcu / $user : null;
 			$workers = isset($caseRows['user_cache']['worker_count']) ? (string) $caseRows['user_cache']['worker_count'] : '';
-			$noteLink = $apcuLossAnchor !== null && $speedup !== null && $speedup < 1.0
+			$bestValue = $bestBackend !== null && isset($caseRows[$bestBackend][$metric]) ? (float) $caseRows[$bestBackend][$metric] : null;
+			$fasterRatio = $user !== null && $user > 0.0 && $bestValue !== null && $bestValue > 0.0 ? $user / $bestValue : null;
+			$noteLink = $apcuLossAnchor !== null && $bestBackend !== null && $bestBackend !== 'user_cache'
 				? '<a class="note-link" href="#' . self::h($apcuLossAnchor) . '">store trade-off note</a>'
 				: '';
-			$html .= '<tr><td>' . $this->workloadLink($case) . $noteLink . '</td>'
-				. $this->metricCell($caseRows['user_cache'] ?? null, $metric, $medianMetric, $bestBackend === 'user_cache')
-				. $this->metricCell($caseRows['apcu'] ?? null, $metric, $medianMetric, $bestBackend === 'apcu')
-				. $this->metricCell($caseRows['deepclone'] ?? null, $metric, $medianMetric, $bestBackend === 'deepclone')
-				. '<td class="num">' . ($speedup !== null ? self::h($this->number($speedup, 2) . 'x') : '<span class="muted">n/a</span>') . '</td>'
+			$html .= '<tr><td>' . $this->workloadLink($case) . $noteLink . '</td>';
+			foreach ($backendNames as $backendName) {
+				$html .= $this->metricCell($caseRows[$backendName] ?? null, $metric, $secondaryMetric, $secondaryLabel, $bestBackend === $backendName);
+			}
+			$html .= '<td class="num">' . ($fasterRatio !== null && $bestBackend !== null ? self::h($this->number($fasterRatio, 2) . 'x (' . $this->backendLabel($bestBackend) . ')') : '<span class="muted">n/a</span>') . '</td>'
 				. ($showWorkers ? '<td class="num">' . self::h($workers) . '</td>' : '')
 				. '</tr>';
 		}
@@ -359,16 +448,21 @@ code {
 		return $html . '</tbody></table>';
 	}
 
-	private function metricCell(?array $row, string $metric, string $medianMetric, bool $winner): string
+	private function metricCell(?array $row, string $metric, string $secondaryMetric, string $secondaryLabel, bool $winner): string
 	{
 		if ($row === null || !isset($row[$metric])) {
 			return '<td class="num"><span class="muted">n/a</span></td>';
 		}
 
 		$class = $winner ? ' class="winner"' : '';
-		$median = isset($row[$medianMetric]) ? (float) $row[$medianMetric] : null;
+		$secondary = isset($row[$secondaryMetric]) ? (float) $row[$secondaryMetric] : null;
+		$interquartile = isset($row['p25_server_us_per_op'], $row['p75_server_us_per_op'])
+			? 'p25-p75 ' . $this->number((float) $row['p25_server_us_per_op'], 3) . '-' . $this->number((float) $row['p75_server_us_per_op'], 3)
+			: null;
+
 		return '<td class="num"><span' . $class . '>' . self::h($this->number((float) $row[$metric], 3)) . ' us</span>'
-			. ($median !== null ? '<span class="small">median ' . self::h($this->number($median, 3)) . '</span>' : '')
+			. ($secondary !== null ? '<span class="small">' . self::h($secondaryLabel . ' ' . $this->number($secondary, 3)) . '</span>' : '')
+			. ($interquartile !== null ? '<span class="small">' . self::h($interquartile) . '</span>' : '')
 			. '</td>';
 	}
 
@@ -382,8 +476,8 @@ code {
 		$html = '<h2>Resident Payload Probe</h2><table><thead><tr><th>Workload</th><th class="num">Resident direct access</th><th class="num">UserCache fetch + access</th><th class="num">Estimated fetch overhead</th><th class="num">Resident / UserCache</th></tr></thead><tbody>';
 		foreach (($resident['rows'] ?? []) as $row) {
 			$case = (string) $row['case'];
-			$residentUs = (float) $row['mean_operation_us'];
-			$userUs = isset($cliRows[$case]['user_cache']) ? (float) $cliRows[$case]['user_cache']['mean_operation_us'] : null;
+			$residentUs = (float) $row['median_us'];
+			$userUs = isset($cliRows[$case]['user_cache']) ? (float) $cliRows[$case]['user_cache']['median_us'] : null;
 			$ratio = $userUs !== null && $userUs > 0.0 ? $residentUs / $userUs : null;
 			$overhead = $userUs !== null ? $userUs - $residentUs : null;
 			$noteLink = $ratio !== null && $ratio < 1.0
@@ -399,20 +493,38 @@ code {
 		return $html . '</tbody></table>';
 	}
 
+	private function fpmTables(string $title, array $runs): string
+	{
+		$html = '';
+		foreach ($runs as $run) {
+			$html .= $this->cacheReadTable(
+				$title . ' (' . $run['label'] . ')',
+				$run['data']['results'] ?? [],
+				'median_server_us_per_op',
+				'mean_server_us_per_op',
+				true,
+				null,
+				'mean'
+			);
+		}
+
+		return $html;
+	}
+
 	private function bulkTables(array $bulkRuns): string
 	{
 		$html = '';
 		foreach ($bulkRuns as $bulkRun) {
 			$data = $bulkRun['data'];
 			$keyCount = (string) ($data['options']['key_count'] ?? '?');
-			$html .= '<h2><a class="workload-link" href="#' . self::h($this->bulkWorkloadId($keyCount)) . '">Bulk Read: ' . self::h($keyCount) . ' Keys</a></h2><table class="bulk-table"><thead><tr><th>Backend</th><th class="num">Mean/batch</th><th class="num">Median/batch</th><th class="num">Mean/key</th></tr></thead><tbody>';
+			$html .= '<h2><a class="workload-link" href="#' . self::h($this->bulkWorkloadId($keyCount)) . '">Bulk Read: ' . self::h($keyCount) . ' Keys</a></h2><table class="bulk-table"><thead><tr><th>Backend</th><th class="num">Median/batch</th><th class="num">Mean/batch</th><th class="num">Mean/key</th></tr></thead><tbody>';
 			$rows = $data['rows'] ?? [];
-			$bestBackend = $this->bestBackendByRows($rows, 'backend', 'mean_us_per_key');
+			$bestBackend = $this->bestBackendByRows($rows, 'backend', 'median_us_per_batch');
 			foreach ($rows as $row) {
 				$winner = $bestBackend === ($row['backend'] ?? null);
-				$html .= '<tr><td><code>' . $this->ident((string) $row['backend']) . '</code></td>'
-					. '<td class="num' . ($winner ? ' winner' : '') . '">' . self::h($this->number((float) $row['mean_us_per_batch'], 3)) . ' us</td>'
-					. '<td class="num">' . self::h($this->number((float) $row['median_us_per_batch'], 3)) . ' us</td>'
+				$html .= '<tr><td><code>' . $this->ident((string) $row['backend']) . '</code><span class="small">' . self::h($this->backendLabel((string) $row['backend'])) . '</span></td>'
+					. '<td class="num' . ($winner ? ' winner' : '') . '">' . self::h($this->number((float) $row['median_us_per_batch'], 3)) . ' us</td>'
+					. '<td class="num">' . self::h($this->number((float) $row['mean_us_per_batch'], 3)) . ' us</td>'
 					. '<td class="num">' . self::h($this->number((float) $row['mean_us_per_key'], 3)) . ' us</td></tr>';
 			}
 			$html .= '</tbody></table>';
@@ -427,9 +539,13 @@ code {
 			'CLI repeated read JSON' => $this->cliReadPath,
 			'CLI write JSON' => $this->cliWritePath,
 			'Resident probe JSON' => $this->residentPath,
-			'FPM one fetch/request JSON' => $this->fpmOncePath,
-			'FPM hot read JSON' => $this->fpmHotPath,
 		];
+		foreach ($this->fpmOncePaths as $index => $path) {
+			$paths['FPM one fetch/request JSON #' . ($index + 1)] = $path;
+		}
+		foreach ($this->fpmHotPaths as $index => $path) {
+			$paths['FPM hot read JSON #' . ($index + 1)] = $path;
+		}
 		foreach ($this->bulkPaths as $index => $path) {
 			$paths['Bulk read JSON #' . ($index + 1)] = $path;
 		}
@@ -445,17 +561,27 @@ code {
 		return $html . '</tbody></table>';
 	}
 
-	private function workloadsSection(?array $cliRead, ?array $cliWrite, ?array $resident, ?array $fpmOnce, ?array $fpmHot, array $bulkRuns): string
+	private function workloadsSection(?array $cliRead, ?array $cliWrite, ?array $resident, array $fpmOnceRuns, array $fpmHotRuns, array $bulkRuns): string
 	{
 		$workloads = [];
 
 		$this->mergeCaseMetadata($workloads, $cliRead['cases'] ?? []);
 		$this->mergeCaseMetadata($workloads, $cliWrite['cases'] ?? []);
+		foreach ($fpmOnceRuns as $run) {
+			$this->mergeCaseMetadata($workloads, $run['data']['cases'] ?? []);
+		}
+		foreach ($fpmHotRuns as $run) {
+			$this->mergeCaseMetadata($workloads, $run['data']['cases'] ?? []);
+		}
 		$this->mergeRows($workloads, $cliRead['read'] ?? [], 'CLI repeated read');
 		$this->mergeRows($workloads, $cliWrite['write'] ?? [], 'CLI store');
 		$this->mergeRows($workloads, $resident['rows'] ?? [], 'Resident direct access');
-		$this->mergeRows($workloads, $fpmOnce['results'] ?? [], 'FPM one fetch/request');
-		$this->mergeRows($workloads, $fpmHot['results'] ?? [], 'FPM hot read');
+		foreach ($fpmOnceRuns as $run) {
+			$this->mergeRows($workloads, $run['data']['results'] ?? [], 'FPM one fetch/request');
+		}
+		foreach ($fpmHotRuns as $run) {
+			$this->mergeRows($workloads, $run['data']['results'] ?? [], 'FPM hot read');
+		}
 
 		if ($workloads === [] && $bulkRuns === []) {
 			return '';
@@ -494,7 +620,7 @@ code {
 	{
 		return '<h2>Notes</h2>'
 			. '<h3 id="resident-baseline-note">Already-resident data is a baseline</h3>'
-			. '<p class="note warn">The resident table does not include UserCache store time. It compares direct access to an already-resident payload with fetching a previously stored UserCache entry and running the same access probe. The difference estimates fetch and materialization overhead after the value has already been stored. The primary comparison for UserCache is against APCu or ext-deepclone when reconstructing object-heavy payloads, not against literals already resident in the request.</p>'
+			. '<p class="note warn">The resident table does not include UserCache store time. It compares direct access to an already-resident payload with fetching a previously stored UserCache entry and running the same access probe. The difference estimates fetch and materialization overhead after the value has already been stored. The primary comparison for UserCache is against APCu/php and APCu/igbinary when reconstructing object-heavy payloads, not against literals already resident in the request.</p>'
 			. '<h3 id="store-tradeoff-note">Slower stores are an expected trade-off for faster reads</h3>'
 			. '<p class="note warn">Store workloads are shown to make the write-side cost explicit. APCu-style shared caches are usually used for read-heavy paths, where a stored value is read many times. Store throughput is an intentional trade-off in this design, not the metric it is optimized for.</p>';
 	}
@@ -510,6 +636,63 @@ code {
 		}
 
 		return $groups;
+	}
+
+	private function backendOrderForRows(array $rows): array
+	{
+		$preferred = ['user_cache', 'apcu', 'apcu_igbinary'];
+		$seen = [];
+		foreach ($rows as $row) {
+			if (isset($row['backend'])) {
+				$seen[(string) $row['backend']] = true;
+			}
+		}
+
+		$ordered = [];
+		foreach ($preferred as $backendName) {
+			if (isset($seen[$backendName])) {
+				$ordered[] = $backendName;
+				unset($seen[$backendName]);
+			}
+		}
+		foreach (array_keys($seen) as $backendName) {
+			$ordered[] = $backendName;
+		}
+
+		return $ordered;
+	}
+
+	private function backendLabel(string $backend): string
+	{
+		return match ($backend) {
+			'user_cache' => 'UserCache',
+			'apcu' => 'APCu/php',
+			'apcu_igbinary' => 'APCu/igbinary',
+			'user_cache_fetch_multiple' => 'UserCache fetchMultiple',
+			'user_cache_fetch_loop' => 'UserCache fetch loop',
+			'apcu_fetch_multiple' => 'APCu fetch array',
+			'apcu_fetch_loop' => 'APCu fetch loop',
+			default => $backend,
+		};
+	}
+
+	private function fpmRunLabel(array $data, int $index): string
+	{
+		$backends = is_array($data['options']['backends'] ?? null) ? $data['options']['backends'] : [];
+		$hasPhpSerializer = in_array('apcu', $backends, true);
+		$hasIgbinarySerializer = in_array('apcu_igbinary', $backends, true);
+
+		if ($hasPhpSerializer && $hasIgbinarySerializer) {
+			return 'combined APCu serializers';
+		}
+		if ($hasIgbinarySerializer) {
+			return 'APCu serializer=igbinary';
+		}
+		if ($hasPhpSerializer) {
+			return 'APCu serializer=php';
+		}
+
+		return 'run ' . (string) ($index + 1);
 	}
 
 	private function mergeCaseMetadata(array &$workloads, array $cases): void

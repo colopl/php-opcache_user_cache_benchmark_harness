@@ -8,10 +8,14 @@ PHP_CLI_BIN=${PHP_CLI_BIN:-"${ROOT}/../sapi/cli/php"}
 NGINX_BIN=${NGINX_BIN:-/usr/sbin/nginx}
 BASE_URL=${BASE_URL:-http://127.0.0.1:8080/user_cache_fpm_read_bench.php}
 APCU_SO=${APCU_SO:-"${ROOT}/runtime/extensions/apcu/apcu.so"}
-DEEPCLONE_SO=${DEEPCLONE_SO:-"${ROOT}/runtime/extensions/deepclone/deepclone.so"}
+IGBINARY_SO=${IGBINARY_SO:-}
 SHM_SIZE=${OPCACHE_USER_CACHE_SHM_SIZE:-64M}
+MEMORY_LIMIT=${OPCACHE_USER_CACHE_BENCHMARK_MEMORY_LIMIT:--1}
 APC_SHM_SIZE=${APC_SHM_SIZE:-128M}
+APC_SERIALIZER=${APC_SERIALIZER:-php}
 OUTPUT_DIR=${OUTPUT_DIR:-"${ROOT}/results"}
+LOCK_DIR=${UC_BENCH_LOCK_DIR:-"${ROOT}/runtime/benchmark.lock"}
+LOCK_ACQUIRED=0
 NGINX_PID=
 PHP_FPM_PID=
 
@@ -27,7 +31,8 @@ Wrapper options:
   --nginx-bin FILE      nginx binary. Default: /usr/sbin/nginx
   --base-url URL        Benchmark endpoint URL.
   --apcu-so FILE        APCu extension module.
-  --deepclone-so FILE   DeepClone extension module.
+  --igbinary-so FILE    igbinary extension module.
+  --apc-serializer NAME APCu serializer. Default: php
   --shm-size SIZE       opcache.user_cache_shm_size. Default: 64M
   --apc-shm-size SIZE   apc.shm_size. Default: 128M
   --output-dir DIR      Result directory. Default: results
@@ -115,6 +120,34 @@ assert_ports_free() {
 	fi
 }
 
+acquire_benchmark_lock() {
+	if test "${UC_BENCH_LOCK_HELD:-0}" = 1; then
+		return
+	fi
+
+	mkdir -p "$(dirname "${LOCK_DIR}")"
+	if ! mkdir "${LOCK_DIR}" 2>/dev/null; then
+		if test -f "${LOCK_DIR}/pid"; then
+			printf 'benchmark lock is already held by pid %s: %s\n' "$(cat "${LOCK_DIR}/pid")" "${LOCK_DIR}" >&2
+		else
+			printf 'benchmark lock is already held: %s\n' "${LOCK_DIR}" >&2
+		fi
+		exit 1
+	fi
+
+	printf '%s\n' "$$" > "${LOCK_DIR}/pid"
+	LOCK_ACQUIRED=1
+	export UC_BENCH_LOCK_HELD=1
+	export UC_BENCH_LOCK_DIR="${LOCK_DIR}"
+}
+
+release_benchmark_lock() {
+	if test "${LOCK_ACQUIRED}" = 1; then
+		rm -rf "${LOCK_DIR}"
+		LOCK_ACQUIRED=0
+	fi
+}
+
 cleanup() {
 	EXIT_CODE=${?}
 	trap - 0 2 15
@@ -126,6 +159,7 @@ cleanup() {
 		kill "${PHP_FPM_PID}" >/dev/null 2>&1 || true
 		wait "${PHP_FPM_PID}" >/dev/null 2>&1 || true
 	fi
+	release_benchmark_lock
 	exit "${EXIT_CODE}"
 }
 
@@ -163,8 +197,12 @@ while test "${#}" -gt 0; do
 			APCU_SO=$(absolute_path "${2:?--apcu-so requires a value}")
 			shift 2
 			;;
-		--deepclone-so)
-			DEEPCLONE_SO=$(absolute_path "${2:?--deepclone-so requires a value}")
+		--igbinary-so)
+			IGBINARY_SO=$(absolute_path "${2:?--igbinary-so requires a value}")
+			shift 2
+			;;
+		--apc-serializer)
+			APC_SERIALIZER=${2:?--apc-serializer requires a value}
 			shift 2
 			;;
 		--shm-size)
@@ -192,33 +230,56 @@ done
 PHP_FPM_BIN=$(absolute_path "${PHP_FPM_BIN}")
 PHP_CLI_BIN=$(absolute_path "${PHP_CLI_BIN}")
 APCU_SO=$(absolute_path "${APCU_SO}")
-DEEPCLONE_SO=$(absolute_path "${DEEPCLONE_SO}")
+if test -n "${IGBINARY_SO}"; then
+	IGBINARY_SO=$(absolute_path "${IGBINARY_SO}")
+fi
 OUTPUT_DIR=$(absolute_path "${OUTPUT_DIR}")
 
 require_executable "${PHP_FPM_BIN}" "php-fpm"
 require_executable "${PHP_CLI_BIN}" "PHP CLI"
 require_executable "${NGINX_BIN}" "nginx"
 require_file "${APCU_SO}" "APCu extension"
-require_file "${DEEPCLONE_SO}" "DeepClone extension"
+if test -n "${IGBINARY_SO}"; then
+	require_file "${IGBINARY_SO}" "igbinary extension"
+fi
 mkdir -p "${OUTPUT_DIR}"
 
 trap cleanup 0 2 15
+acquire_benchmark_lock
 assert_ports_free
 
 cd "${ROOT}"
 
-"${PHP_FPM_BIN}" \
+if test -n "${IGBINARY_SO}"; then
+	"${PHP_FPM_BIN}" \
+		-n \
+		-d "extension=${APCU_SO}" \
+		-d "extension=${IGBINARY_SO}" \
+		-d "memory_limit=${MEMORY_LIMIT}" \
+		-d apc.enabled=1 \
+		-d "apc.shm_size=${APC_SHM_SIZE}" \
+		-d "apc.serializer=${APC_SERIALIZER}" \
+		-d opcache.enable=1 \
+		-d opcache.enable_cli=0 \
+		-d opcache.validate_timestamps=0 \
+		-d opcache.jit=0 \
+		-d "opcache.user_cache_shm_size=${SHM_SIZE}" \
+		-y "${ROOT}/php-fpm.conf" &
+else
+	"${PHP_FPM_BIN}" \
 	-n \
 	-d "extension=${APCU_SO}" \
-	-d "extension=${DEEPCLONE_SO}" \
+	-d "memory_limit=${MEMORY_LIMIT}" \
 	-d apc.enabled=1 \
 	-d "apc.shm_size=${APC_SHM_SIZE}" \
+	-d "apc.serializer=${APC_SERIALIZER}" \
 	-d opcache.enable=1 \
 	-d opcache.enable_cli=0 \
 	-d opcache.validate_timestamps=0 \
 	-d opcache.jit=0 \
 	-d "opcache.user_cache_shm_size=${SHM_SIZE}" \
 	-y "${ROOT}/php-fpm.conf" &
+fi
 PHP_FPM_PID=${!}
 
 "${NGINX_BIN}" -p "${ROOT}" -c "${ROOT}/nginx.conf" &

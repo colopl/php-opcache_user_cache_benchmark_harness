@@ -1,7 +1,6 @@
 <?php
 
 declare(strict_types=1);
-
 require_once dirname(__DIR__) . '/scripts/UserCacheBenchmark.php';
 
 header('Content-Type: application/json');
@@ -33,7 +32,12 @@ function uc_fpm_read_backends(): array
 	return [
 		'user_cache' => new UcBenchUserCacheBackend('fpm-user-cache-read-bench'),
 		'apcu' => new UcBenchApcuBackend(),
-		'deepclone' => new UcBenchDeepCloneBackend(),
+		'apcu_igbinary' => new UcBenchApcuBackend(
+			'apcu_igbinary',
+			'APCu/igbinary store/fetch',
+			'igbinary',
+			true,
+		),
 	];
 }
 
@@ -59,9 +63,9 @@ function uc_fpm_read_case(string $caseName): array
 	return $cases[$caseName];
 }
 
-function uc_fpm_read_key(string $caseName): string
+function uc_fpm_read_key(string $caseName, string $backendName): string
 {
-	return 'opcache_user_cache_fpm_read_benchmark.' . UC_BENCH_VERSION . '.' . $caseName;
+	return 'opcache_user_cache_fpm_read_benchmark.' . UC_BENCH_VERSION . '.' . $backendName . '.' . $caseName;
 }
 
 try {
@@ -81,9 +85,7 @@ try {
 		$userCacheAvailable = false;
 		$userCacheReason = null;
 		if (class_exists('Opcache\\UserCache')) {
-			$info = (new Opcache\UserCache('fpm-user-cache-read-bench'))->info();
-			$userCacheAvailable = $info->available;
-			$userCacheReason = $info->unavailableReason;
+			[$userCacheAvailable, $userCacheReason] = uc_bench_user_cache_status();
 		}
 
 		uc_fpm_read_json([
@@ -99,7 +101,7 @@ try {
 			],
 			'extensions' => [
 				'apcu' => extension_loaded('apcu'),
-				'deepclone' => function_exists('deepclone_to_array') && function_exists('deepclone_from_array'),
+				'igbinary' => function_exists('igbinary_serialize') && function_exists('igbinary_unserialize'),
 			],
 			'cases' => array_keys(UcBenchPayloadFactory::all()),
 			'backends' => $backendInfo,
@@ -114,7 +116,7 @@ try {
 
 	$case = uc_fpm_read_case($caseName);
 	$backend = uc_fpm_read_backend($backendName);
-	$key = uc_fpm_read_key($caseName);
+	$key = uc_fpm_read_key($caseName, $backendName);
 
 	if ($action === 'clear') {
 		$backend->clear();
@@ -130,7 +132,6 @@ try {
 	if ($action === 'prime') {
 		$payload = $case['build']();
 		$digest = $case['digest']($payload);
-		$backend->clear();
 		$backend->store($key, $payload);
 		$fetched = $backend->fetch($key);
 		$actualDigest = $case['digest']($fetched);
@@ -148,6 +149,23 @@ try {
 		]);
 	}
 
+	if ($action === 'collect_cycles') {
+		$holdUs = uc_fpm_read_param_int('hold_us', 0, 0, 1000000);
+		$collected = gc_collect_cycles();
+		if ($holdUs > 0) {
+			usleep($holdUs);
+		}
+
+		uc_fpm_read_json([
+			'ok' => true,
+			'pid' => $pid,
+			'action' => $action,
+			'case' => $caseName,
+			'backend' => $backendName,
+			'collected' => $collected,
+		]);
+	}
+
 	if ($action !== 'measure') {
 		throw new InvalidArgumentException('Unknown action: ' . $action);
 	}
@@ -159,20 +177,33 @@ try {
 		: $case['digest']($case['build']());
 	$mutate = $case['mutate'];
 	$probe = $case['probe'];
+	$gcWasEnabled = $case['collect_cycles_after_fetch'] && gc_enabled();
 	$touch = 0;
 	$value = null;
 
+	if ($gcWasEnabled) {
+		gc_disable();
+	}
+
 	$started = hrtime(true);
-	for ($i = 0; $i < $operations; $i++) {
-		$value = $backend->fetch($key);
-		if ($probe !== null) {
-			$touch ^= $probe($value, $i);
+	$elapsedNs = 0;
+	try {
+		for ($i = 0; $i < $operations; $i++) {
+			$value = $backend->fetch($key);
+			if ($probe !== null) {
+				$touch ^= $probe($value, $i);
+			}
+			if ($mutate !== null) {
+				$mutate($value, $i);
+			}
 		}
-		if ($mutate !== null) {
-			$mutate($value, $i);
+
+		$elapsedNs = hrtime(true) - $started;
+	} finally {
+		if ($gcWasEnabled) {
+			gc_enable();
 		}
 	}
-	$elapsedNs = hrtime(true) - $started;
 
 	$verify = $backend->fetch($key);
 	$actualDigest = $case['digest']($verify);

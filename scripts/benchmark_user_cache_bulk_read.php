@@ -1,7 +1,6 @@
 <?php
 
 declare(strict_types=1);
-
 require_once __DIR__ . '/UserCacheBenchmark.php';
 
 interface UcBulkReadBackend
@@ -47,10 +46,10 @@ final class UcBulkReadUserCacheBackend extends UcBulkReadAbstractBackend
 			return;
 		}
 
-		$this->cache = new Opcache\UserCache('bulk-read-benchmark');
-		$info = $this->cache->info();
-		if (!$info->available) {
-			$this->unavailable($info->unavailableReason ?? 'Opcache\\UserCache is unavailable');
+		$this->cache = Opcache\UserCache::getPool('bulk-read-benchmark');
+		[$available, $reason] = uc_bench_user_cache_status();
+		if (!$available) {
+			$this->unavailable($reason ?? 'Opcache\\UserCache is unavailable');
 		}
 	}
 
@@ -95,10 +94,10 @@ final class UcBulkReadUserCacheLoopBackend extends UcBulkReadAbstractBackend
 			return;
 		}
 
-		$this->cache = new Opcache\UserCache('bulk-read-loop-benchmark');
-		$info = $this->cache->info();
-		if (!$info->available) {
-			$this->unavailable($info->unavailableReason ?? 'Opcache\\UserCache is unavailable');
+		$this->cache = Opcache\UserCache::getPool('bulk-read-loop-benchmark');
+		[$available, $reason] = uc_bench_user_cache_status();
+		if (!$available) {
+			$this->unavailable($reason ?? 'Opcache\\UserCache is unavailable');
 		}
 	}
 

@@ -1,7 +1,6 @@
 <?php
 
 declare(strict_types=1);
-
 const UC_BENCH_VERSION = 'user-cache-benchmark-1';
 
 error_reporting(E_ALL & ~E_DEPRECATED & ~E_USER_DEPRECATED);
@@ -18,6 +17,154 @@ final class UcBenchMetadataLeaf
 		public int $score,
 		public array $flags,
 	) {
+	}
+}
+
+final class UcBenchSerializeEntity
+{
+	public function __construct(
+		private int $id,
+		private string $name,
+		private array $attributes,
+		private ?UcBenchSerializeEntity $related = null,
+	) {
+	}
+
+	public function __serialize(): array
+	{
+		return [
+			'id' => $this->id,
+			'name' => $this->name,
+			'attributes' => $this->attributes,
+			'related' => $this->related,
+		];
+	}
+
+	public function __unserialize(array $data): void
+	{
+		$this->id = $data['id'];
+		$this->name = $data['name'];
+		$this->attributes = $data['attributes'];
+		$this->related = $data['related'];
+	}
+
+	public function summary(): int
+	{
+		return $this->id + count($this->attributes) + ($this->related?->id ?? 0);
+	}
+
+	public function relatedEntity(): ?UcBenchSerializeEntity
+	{
+		return $this->related;
+	}
+}
+
+final class UcBenchUnserializeOnlyEntity
+{
+	private int $checksum;
+
+	public function __construct(
+		private int $id,
+		private string $name,
+		private array $attributes,
+		private ?UcBenchUnserializeOnlyEntity $related = null,
+	) {
+		$this->checksum = self::calculateChecksum($id, $name, $attributes, $related);
+	}
+
+	public function __unserialize(array $data): void
+	{
+		$this->id = $data["\0" . self::class . "\0id"];
+		$this->name = $data["\0" . self::class . "\0name"];
+		$this->attributes = $data["\0" . self::class . "\0attributes"];
+		$this->related = $data["\0" . self::class . "\0related"];
+		$this->checksum = self::calculateChecksum($this->id, $this->name, $this->attributes, $this->related);
+	}
+
+	public function summary(): int
+	{
+		return $this->checksum + ($this->related?->checksum ?? 0);
+	}
+
+	public function relatedEntity(): ?UcBenchUnserializeOnlyEntity
+	{
+		return $this->related;
+	}
+
+	private static function calculateChecksum(
+		int $id,
+		string $name,
+		array $attributes,
+		?UcBenchUnserializeOnlyEntity $related
+	): int {
+		return $id + strlen($name) + count($attributes) + ($related?->id ?? 0);
+	}
+}
+
+final class UcBenchSleepEntity
+{
+	public string $loadedFrom = 'constructor';
+
+	public function __construct(
+		public int $id,
+		public string $email,
+		public array $roles,
+		public array $profile,
+	) {
+	}
+
+	public function __sleep(): array
+	{
+		return ['id', 'email', 'roles', 'profile'];
+	}
+
+	public function __wakeup(): void
+	{
+		$this->loadedFrom = 'cache';
+	}
+}
+
+final class UcBenchTreeNode
+{
+	public ?UcBenchTreeNode $parent = null;
+	/** @var UcBenchTreeNode[] */
+	public array $children = [];
+
+	public function __construct(
+		public string $name,
+		public array $attributes,
+	) {
+	}
+
+	public function __sleep(): array
+	{
+		return ['parent', 'children', 'name', 'attributes'];
+	}
+
+	public function __wakeup(): void
+	{
+	}
+}
+
+final class UcBenchSleepWakeupPayload
+{
+	public string $transient = 'not-cached';
+
+	public function __construct(
+		public string $name,
+		public array $routes,
+		public array $settings,
+	) {
+	}
+
+	public function __sleep(): array
+	{
+		return ['name', 'routes', 'settings'];
+	}
+
+	public function __wakeup(): void
+	{
+		$this->transient = 'rehydrated';
 	}
 }
 
@@ -129,6 +276,31 @@ final class UcBenchMetadataPayload
 	}
 }
 
+final class UcBenchProductCard
+{
+	public function __construct(
+		public int $id,
+		public string $sku,
+		public string $title,
+		public int $priceCents,
+		public array $badges,
+		public UcBenchReferencedPayload $seller,
+	) {
+	}
+}
+
+final class UcBenchProductListingPayload
+{
+	public function __construct(
+		public string $cacheKey,
+		public DateTimeImmutable $generatedAt,
+		public array $products,
+		public array $facets,
+		public array $context,
+	) {
+	}
+}
+
 interface UcBenchBackend
 {
 	public function name(): string;
@@ -138,6 +310,34 @@ interface UcBenchBackend
 	public function clear(): void;
 	public function store(string $key, mixed $value): void;
 	public function fetch(string $key): mixed;
+}
+
+function uc_bench_unavailable_reason_to_string(mixed $reason): ?string
+{
+	if ($reason === null) {
+		return null;
+	}
+
+	if ($reason instanceof UnitEnum) {
+		if ($reason->name === 'Available') {
+			return null;
+		}
+
+		return $reason->name;
+	}
+
+	return (string) $reason;
+}
+
+function uc_bench_user_cache_status(): array
+{
+	$status = Opcache\UserCache::getStatus();
+	$availability = $status->getAvailability();
+
+	return [
+		$availability instanceof UnitEnum && $availability->name === 'Available',
+		uc_bench_unavailable_reason_to_string($availability),
+	];
 }
 
 abstract class UcBenchAbstractBackend implements UcBenchBackend
@@ -165,6 +365,7 @@ abstract class UcBenchAbstractBackend implements UcBenchBackend
 final class UcBenchUserCacheBackend extends UcBenchAbstractBackend
 {
 	private ?Opcache\UserCache $cache = null;
+	private static ?stdClass $default = null;
 
 	public function __construct(private readonly string $scope)
 	{
@@ -174,10 +375,8 @@ final class UcBenchUserCacheBackend extends UcBenchAbstractBackend
 		}
 
 		try {
-			$this->cache = new Opcache\UserCache($scope);
-			$info = $this->cache->info();
-			$this->available = $info->available;
-			$this->unavailableReason = $info->unavailableReason;
+			$this->cache = Opcache\UserCache::getPool($scope);
+			[$this->available, $this->unavailableReason] = uc_bench_user_cache_status();
 			if (!$this->available && $this->unavailableReason === null) {
 				$this->unavailableReason = 'Opcache\\UserCache is disabled or unavailable';
 			}
@@ -212,7 +411,7 @@ final class UcBenchUserCacheBackend extends UcBenchAbstractBackend
 
 	public function fetch(string $key): mixed
 	{
-		$default = new stdClass();
+		$default = self::$default ??= new stdClass();
 		$value = $this->cache?->fetch($key, $default);
 		if ($value === $default) {
 			throw new RuntimeException('Opcache\\UserCache::fetch() missed key ' . $key);
@@ -222,9 +421,35 @@ final class UcBenchUserCacheBackend extends UcBenchAbstractBackend
 	}
 }
 
-final class UcBenchApcuBackend extends UcBenchAbstractBackend
+abstract class UcBenchApcuBasedBackend extends UcBenchAbstractBackend
 {
-	public function __construct()
+	public function __construct(
+		private readonly string $backendName,
+		private readonly string $backendLabel,
+		private readonly ?string $expectedSerializer,
+		private readonly bool $requiresIgbinary,
+	) {
+		$this->initializeAvailability();
+	}
+
+	public function name(): string
+	{
+		return $this->backendName;
+	}
+
+	public function label(): string
+	{
+		return $this->backendLabel;
+	}
+
+	public function clear(): void
+	{
+		if (!apcu_clear_cache()) {
+			throw new RuntimeException('apcu_clear_cache() failed for ' . $this->backendName);
+		}
+	}
+
+	private function initializeAvailability(): void
 	{
 		if (!function_exists('apcu_fetch') || !function_exists('apcu_store') || !function_exists('apcu_clear_cache')) {
 			$this->unavailable('APCu extension is not loaded');
@@ -236,24 +461,32 @@ final class UcBenchApcuBackend extends UcBenchAbstractBackend
 			return;
 		}
 
+		if ($this->expectedSerializer !== null) {
+			$actualSerializer = (string) ini_get('apc.serializer');
+			if ($actualSerializer !== $this->expectedSerializer) {
+				$this->unavailable('APCu serializer is ' . $actualSerializer . '; expected ' . $this->expectedSerializer);
+				return;
+			}
+		}
+
+		if ($this->requiresIgbinary && (!function_exists('igbinary_serialize') || !function_exists('igbinary_unserialize'))) {
+			$this->unavailable('igbinary extension is not loaded');
+			return;
+		}
+
 		$this->available = true;
 	}
+}
 
-	public function name(): string
-	{
-		return 'apcu';
-	}
-
-	public function label(): string
-	{
-		return 'apcu_store / apcu_fetch';
-	}
-
-	public function clear(): void
-	{
-		if (!apcu_clear_cache()) {
-			throw new RuntimeException('apcu_clear_cache() failed');
-		}
+final class UcBenchApcuBackend extends UcBenchApcuBasedBackend
+{
+	public function __construct(
+		string $name = 'apcu',
+		string $label = 'APCu/php store/fetch',
+		?string $expectedSerializer = 'php',
+		bool $requiresIgbinary = false,
+	) {
+		parent::__construct($name, $label, $expectedSerializer, $requiresIgbinary);
 	}
 
 	public function store(string $key, mixed $value): void
@@ -275,70 +508,13 @@ final class UcBenchApcuBackend extends UcBenchAbstractBackend
 	}
 }
 
-final class UcBenchDeepCloneBackend extends UcBenchAbstractBackend
-{
-	public function __construct()
-	{
-		if (!function_exists('apcu_fetch') || !function_exists('apcu_store') || !function_exists('apcu_clear_cache')) {
-			$this->unavailable('APCu extension is not loaded');
-			return;
-		}
-
-		if (function_exists('apcu_enabled') && !apcu_enabled()) {
-			$this->unavailable('APCu is loaded but disabled; use apc.enable_cli=1 for CLI runs');
-			return;
-		}
-
-		if (!function_exists('deepclone_to_array') || !function_exists('deepclone_from_array')) {
-			$this->unavailable('deepclone extension is not loaded');
-			return;
-		}
-
-		$this->available = true;
-	}
-
-	public function name(): string
-	{
-		return 'deepclone';
-	}
-
-	public function label(): string
-	{
-		return 'apcu_store(deepclone array) / apcu_fetch + deepclone_from_array';
-	}
-
-	public function clear(): void
-	{
-		if (!apcu_clear_cache()) {
-			throw new RuntimeException('apcu_clear_cache() failed for deepclone backend');
-		}
-	}
-
-	public function store(string $key, mixed $value): void
-	{
-		if (!apcu_store($key, deepclone_to_array($value))) {
-			throw new RuntimeException('deepclone_to_array() + apcu_store() failed for key ' . $key);
-		}
-	}
-
-	public function fetch(string $key): mixed
-	{
-		$success = false;
-		$value = apcu_fetch($key, $success);
-		if (!$success) {
-			throw new RuntimeException('apcu_fetch() missed deepclone key ' . $key);
-		}
-
-		return deepclone_from_array($value);
-	}
-}
-
 final class UcBenchPayloadFactory
 {
 	private const LARGE_ROW_COUNT = 192;
 	private const CARBON_TIMELINE_COUNT = 64;
 	private const SPL_COLLECTION_COUNT = 64;
 	private const MULTI_KEY_CONFIG_COUNT = 32;
+	private const PRODUCT_CARD_COUNT = 80;
 	private const LARGE_STRING_REPEAT_COUNT = 4096;
 
 	private const CONSTANT_ARRAY_PAYLOAD = [
@@ -432,6 +608,75 @@ final class UcBenchPayloadFactory
 				},
 				static fn (mixed $payload, int $operation): int => self::metadataObjectProbe($payload, $operation),
 			),
+			'sleep_wakeup_object' => self::case(
+				'__sleep()/__wakeup() contract object',
+				'Object routed through the serialization contract: __sleep() filters state on store, __wakeup() runs per fetch.',
+				static fn (): mixed => self::buildSleepWakeupPayload('sleep-wakeup'),
+				static fn (mixed $payload): string => self::sleepWakeupDigest($payload),
+				null,
+				static fn (mixed $payload, int $operation): int => self::sleepWakeupProbe($payload, $operation),
+			),
+			'serialize_magic_entity' => self::case(
+				'__serialize()/__unserialize() entity',
+				'Modern entity pair using the __serialize()/__unserialize() contract with a related entity.',
+				static fn (): mixed => self::buildSerializeEntityPayload(),
+				static fn (mixed $payload): string => self::serializeEntityDigest($payload),
+				null,
+				static fn (mixed $payload, int $operation): int => self::serializeEntityProbe($payload, $operation),
+			),
+			'unserialize_only_entity' => self::case(
+				'__unserialize() only entity',
+				'Userland entity declaring __unserialize() without __serialize(), matching the legacy object-data format.',
+				static fn (): mixed => self::buildUnserializeOnlyEntityPayload(),
+				static fn (mixed $payload): string => self::unserializeOnlyEntityDigest($payload),
+				null,
+				static fn (mixed $payload, int $operation): int => self::unserializeOnlyEntityProbe($payload, $operation),
+			),
+			'sleep_wakeup_entity_collection' => self::case(
+				'__sleep() entity result-set collection',
+				'ORM-style result set: 100 small entities each running the __sleep()/__wakeup() contract.',
+				static fn (): mixed => self::buildSleepEntityCollection(),
+				static fn (mixed $payload): string => self::sleepEntityCollectionDigest($payload),
+				null,
+				static fn (mixed $payload, int $operation): int => self::sleepEntityCollectionProbe($payload, $operation),
+			),
+			'sleep_wakeup_large_dataset' => self::case(
+				'__sleep() object holding a large dataset',
+				'Report-style object with the standard large row set behind the serialization contract.',
+				static fn (): mixed => new UcBenchSleepWakeupPayload(
+					'large-dataset',
+					self::buildLargeRows('serialized'),
+					['limits' => ['rate' => 500], 'source' => 'report'],
+				),
+				static fn (mixed $payload): string => self::sleepWakeupLargeDatasetDigest($payload),
+				null,
+				static fn (mixed $payload, int $operation): int => self::sleepWakeupLargeDatasetProbe($payload, $operation),
+			),
+			'recursive_reference_graph' => self::case(
+				'Recursive parent/child reference graph',
+				'Category-tree object graph with parent back-references and the __sleep()/__wakeup() contract.',
+				static fn (): mixed => self::buildRecursiveReferenceGraph(),
+				static fn (mixed $payload): string => self::recursiveReferenceGraphDigest($payload),
+				null,
+				static fn (mixed $payload, int $operation): int => self::recursiveReferenceGraphProbe($payload, $operation),
+				true,
+			),
+			'mixed_serialization_payload' => self::case(
+				'Mixed plain and contract payload',
+				'Realistic cache entry mixing plain arrays, __serialize() entities, and __sleep() objects.',
+				static fn (): mixed => self::buildMixedSerializationPayload(),
+				static fn (mixed $payload): string => self::mixedSerializationDigest($payload),
+				null,
+				static fn (mixed $payload, int $operation): int => self::mixedSerializationProbe($payload, $operation),
+			),
+			'product_listing_view_model' => self::case(
+				'Product listing view-model',
+				'Production-shaped product-list cache entry mixing DTO objects, facet arrays, pagination context, and generated-at metadata.',
+				static fn (): mixed => self::buildProductListingPayload(),
+				static fn (mixed $payload): string => self::productListingDigest($payload),
+				null,
+				static fn (mixed $payload, int $operation): int => self::productListingProbe($payload, $operation),
+			),
 			'multi_key_config_read' => self::case(
 				'Multi-key configuration read',
 				'Configuration-entry map carried over from the old multi-key workload.',
@@ -505,6 +750,7 @@ final class UcBenchPayloadFactory
 				static fn (mixed $payload): string => self::serializedCycleDigest($payload),
 				null,
 				static fn (mixed $payload, int $operation): int => self::cycleProbe($payload, $operation),
+				true,
 			),
 			'reference_assignment_object' => self::case(
 				'Assigned object with child reference',
@@ -524,6 +770,7 @@ final class UcBenchPayloadFactory
 				static fn (mixed $payload): string => self::cycleDigest($payload),
 				null,
 				static fn (mixed $payload, int $operation): int => self::cycleProbe($payload, $operation),
+				true,
 			),
 			'nested_array_assignment' => self::case(
 				'Assigned nested array mutation',
@@ -557,7 +804,7 @@ final class UcBenchPayloadFactory
 		return $selected;
 	}
 
-	private static function case(string $label, string $description, callable $build, callable $digest, ?callable $mutate = null, ?callable $probe = null): array
+	private static function case(string $label, string $description, callable $build, callable $digest, ?callable $mutate = null, ?callable $probe = null, bool $collectCyclesAfterFetch = false): array
 	{
 		return [
 			'label' => $label,
@@ -566,6 +813,7 @@ final class UcBenchPayloadFactory
 			'digest' => $digest,
 			'mutate' => $mutate,
 			'probe' => $probe,
+			'collect_cycles_after_fetch' => $collectCyclesAfterFetch,
 		];
 	}
 
@@ -986,6 +1234,353 @@ final class UcBenchPayloadFactory
 		return $payload->owner->revision + $route['score'] + strlen($service['class']);
 	}
 
+	private static function buildSleepWakeupPayload(string $name): UcBenchSleepWakeupPayload
+	{
+		$routes = [];
+		for ($i = 0; $i < 48; $i++) {
+			$routes['route_' . $i] = [
+				'path' => '/api/v1/resource/' . $i,
+				'controller' => 'App\\Controller\\Resource' . ($i % 7) . 'Controller::show',
+				'methods' => ['GET', 'POST'],
+				'score' => $i * 3,
+			];
+		}
+
+		$settings = [
+			'cache' => ['ttl' => 300, 'jitter' => 15, 'tags' => ['a', 'b', 'c']],
+			'limits' => ['rate' => 1000, 'burst' => 50],
+			'flags' => array_fill_keys(range('a', 'p'), true),
+		];
+
+		return new UcBenchSleepWakeupPayload($name, $routes, $settings);
+	}
+
+	private static function sleepWakeupDigest(mixed $payload): string
+	{
+		if (!$payload instanceof UcBenchSleepWakeupPayload) {
+			throw new RuntimeException('Sleep/wakeup payload has an unexpected type');
+		}
+
+		return sha1($payload->name . '|' . count($payload->routes) . '|' . json_encode($payload->settings));
+	}
+
+	private static function sleepWakeupProbe(mixed $payload, int $operation): int
+	{
+		if (!$payload instanceof UcBenchSleepWakeupPayload) {
+			throw new RuntimeException('Sleep/wakeup payload has an unexpected type');
+		}
+
+		$route = $payload->routes['route_' . ($operation % 48)] ?? null;
+		if (!is_array($route)) {
+			throw new RuntimeException('Sleep/wakeup payload is incomplete');
+		}
+
+		return $route['score'] + strlen($route['controller']) + $payload->settings['limits']['rate'];
+	}
+
+	private static function buildSerializeEntityPayload(): UcBenchSerializeEntity
+	{
+		$attributes = [];
+		for ($i = 0; $i < 40; $i++) {
+			$attributes['attr_' . $i] = [
+				'value' => 'value-' . $i . '-' . str_repeat('e', 24),
+				'rank' => $i * 7,
+			];
+		}
+
+		$related = new UcBenchSerializeEntity(9001, 'related-entity', ['kind' => ['value' => 'child', 'rank' => 1]]);
+
+		return new UcBenchSerializeEntity(4242, 'primary-entity', $attributes, $related);
+	}
+
+	private static function serializeEntityDigest(mixed $payload): string
+	{
+		if (!$payload instanceof UcBenchSerializeEntity) {
+			throw new RuntimeException('Serialize-entity payload has an unexpected type');
+		}
+
+		return sha1($payload->summary() . '|' . ($payload->relatedEntity()?->summary() ?? -1));
+	}
+
+	private static function serializeEntityProbe(mixed $payload, int $operation): int
+	{
+		if (!$payload instanceof UcBenchSerializeEntity) {
+			throw new RuntimeException('Serialize-entity payload has an unexpected type');
+		}
+
+		return $payload->summary() + ($operation % 13);
+	}
+
+	private static function buildUnserializeOnlyEntityPayload(): UcBenchUnserializeOnlyEntity
+	{
+		$attributes = [];
+		for ($i = 0; $i < 40; $i++) {
+			$attributes['attr_' . $i] = [
+				'value' => 'value-' . $i . '-' . str_repeat('u', 24),
+				'rank' => $i * 11,
+			];
+		}
+
+		$related = new UcBenchUnserializeOnlyEntity(7001, 'related-unserialize-only', ['kind' => ['value' => 'child', 'rank' => 1]]);
+
+		return new UcBenchUnserializeOnlyEntity(31337, 'primary-unserialize-only', $attributes, $related);
+	}
+
+	private static function unserializeOnlyEntityDigest(mixed $payload): string
+	{
+		if (!$payload instanceof UcBenchUnserializeOnlyEntity) {
+			throw new RuntimeException('Unserialize-only entity payload has an unexpected type');
+		}
+
+		return sha1($payload->summary() . '|' . ($payload->relatedEntity()?->summary() ?? -1));
+	}
+
+	private static function unserializeOnlyEntityProbe(mixed $payload, int $operation): int
+	{
+		if (!$payload instanceof UcBenchUnserializeOnlyEntity) {
+			throw new RuntimeException('Unserialize-only entity payload has an unexpected type');
+		}
+
+		return $payload->summary() + ($operation % 13);
+	}
+
+	private static function buildSleepEntityCollection(): array
+	{
+		$entities = [];
+		for ($i = 0; $i < 100; $i++) {
+			$entities[] = new UcBenchSleepEntity(
+				$i,
+				'user' . $i . '@example.test',
+				$i % 3 === 0 ? ['admin', 'editor'] : ['viewer'],
+				[
+					'display_name' => 'User ' . $i,
+					'preferences' => ['locale' => $i % 2 === 0 ? 'ja_JP' : 'en_US', 'theme' => 'dark'],
+					'counters' => [$i, $i * 2, $i * 3],
+				],
+			);
+		}
+
+		return $entities;
+	}
+
+	private static function sleepEntityCollectionDigest(mixed $payload): string
+	{
+		if (!is_array($payload) || count($payload) !== 100) {
+			throw new RuntimeException('Sleep-entity collection has an unexpected shape');
+		}
+
+		$sum = 0;
+		foreach ($payload as $entity) {
+			if (!$entity instanceof UcBenchSleepEntity) {
+				throw new RuntimeException('Sleep-entity collection element has an unexpected type');
+			}
+
+			$sum += $entity->id + count($entity->roles) + strlen($entity->email);
+		}
+
+		return sha1((string) $sum);
+	}
+
+	private static function sleepEntityCollectionProbe(mixed $payload, int $operation): int
+	{
+		$entity = $payload[$operation % 100] ?? null;
+		if (!$entity instanceof UcBenchSleepEntity) {
+			throw new RuntimeException('Sleep-entity collection is incomplete');
+		}
+
+		return $entity->id + count($entity->profile['counters']) + strlen($entity->profile['display_name']);
+	}
+
+	private static function sleepWakeupLargeDatasetDigest(mixed $payload): string
+	{
+		if (!$payload instanceof UcBenchSleepWakeupPayload) {
+			throw new RuntimeException('Large-dataset payload has an unexpected type');
+		}
+
+		return sha1($payload->name . '|' . count($payload->routes) . '|' . ($payload->routes[0]['title'] ?? ''));
+	}
+
+	private static function sleepWakeupLargeDatasetProbe(mixed $payload, int $operation): int
+	{
+		if (!$payload instanceof UcBenchSleepWakeupPayload) {
+			throw new RuntimeException('Large-dataset payload has an unexpected type');
+		}
+
+		$row = $payload->routes[$operation % self::LARGE_ROW_COUNT] ?? null;
+		if (!is_array($row)) {
+			throw new RuntimeException('Large-dataset payload is incomplete');
+		}
+
+		return $row['id'] + strlen($row['title']) + count($row['weights']);
+	}
+
+	private static function buildRecursiveReferenceGraph(): UcBenchTreeNode
+	{
+		$root = new UcBenchTreeNode('root', ['depth' => 0]);
+		for ($i = 0; $i < 12; $i++) {
+			$category = new UcBenchTreeNode('category-' . $i, ['depth' => 1, 'index' => $i]);
+			$category->parent = $root;
+			for ($j = 0; $j < 6; $j++) {
+				$item = new UcBenchTreeNode('item-' . $i . '-' . $j, [
+					'depth' => 2,
+					'sku' => sprintf('SKU-%03d-%02d', $i, $j),
+					'tags' => ['tree', 'node', 'leaf-' . ($j % 3)],
+				]);
+				$item->parent = $category;
+				$category->children[] = $item;
+			}
+			$root->children[] = $category;
+		}
+
+		return $root;
+	}
+
+	private static function recursiveReferenceGraphDigest(mixed $payload): string
+	{
+		if (!$payload instanceof UcBenchTreeNode) {
+			throw new RuntimeException('Recursive graph payload has an unexpected type');
+		}
+
+		/* Cycle-safe digest: back-references are validated by identity, not
+		 * by re-walking them. */
+		$parts = [$payload->name, count($payload->children)];
+		foreach ($payload->children as $category) {
+			$parts[] = $category->name;
+			$parts[] = $category->parent === $payload ? 'p1' : 'p0';
+			foreach ($category->children as $item) {
+				$parts[] = $item->attributes['sku'];
+				$parts[] = $item->parent === $category ? 'p1' : 'p0';
+			}
+		}
+
+		return sha1(implode('|', $parts));
+	}
+
+	private static function recursiveReferenceGraphProbe(mixed $payload, int $operation): int
+	{
+		if (!$payload instanceof UcBenchTreeNode) {
+			throw new RuntimeException('Recursive graph payload has an unexpected type');
+		}
+
+		$category = $payload->children[$operation % 12] ?? null;
+		$item = $category?->children[$operation % 6] ?? null;
+		if ($item === null || $item->parent !== $category || $category->parent !== $payload) {
+			throw new RuntimeException('Recursive graph back-references are broken');
+		}
+
+		return strlen($item->attributes['sku']) + $category->attributes['index'];
+	}
+
+	private static function buildMixedSerializationPayload(): array
+	{
+		return [
+			'config' => ['ttl' => 600, 'tags' => ['mixed', 'payload'], 'limits' => ['rate' => 250, 'burst' => 25]],
+			'entity' => self::buildSerializeEntityPayload(),
+			'report' => new UcBenchSleepWakeupPayload('mixed-report', ['route_0' => ['score' => 3]], ['flags' => []]),
+			'rows' => array_slice(self::buildLargeRows('mixed'), 0, 24),
+		];
+	}
+
+	private static function buildProductListingPayload(): UcBenchProductListingPayload
+	{
+		$products = [];
+		for ($index = 0; $index < self::PRODUCT_CARD_COUNT; $index++) {
+			$products[] = new UcBenchProductCard(
+				100000 + $index,
+				sprintf('SKU-%05d', $index),
+				'Benchmark Product ' . $index . ' ' . str_repeat(chr(65 + ($index % 26)), 12),
+				1200 + ($index * 37),
+				[
+					'new' => $index % 7 === 0,
+					'discount' => $index % 5 === 0 ? 10 + ($index % 4) * 5 : 0,
+					'tags' => ['tenant-' . ($index % 8), 'category-' . ($index % 12)],
+				],
+				new UcBenchReferencedPayload('seller-' . ($index % 9), 500 + ($index % 9)),
+			);
+		}
+
+		$facets = [];
+		for ($facet = 0; $facet < 12; $facet++) {
+			$buckets = [];
+			for ($bucket = 0; $bucket < 8; $bucket++) {
+				$buckets[] = [
+					'value' => 'facet-' . $facet . '-bucket-' . $bucket,
+					'count' => 1000 - ($facet * 17) - ($bucket * 11),
+					'selected' => $bucket === $facet % 8,
+				];
+			}
+			$facets['facet_' . $facet] = $buckets;
+		}
+
+		return new UcBenchProductListingPayload(
+			'tenant-3:catalog:query:summer-sale',
+			new DateTimeImmutable('2026-06-30 09:15:00', new DateTimeZone('UTC')),
+			$products,
+			$facets,
+			[
+				'tenant' => 'tenant-3',
+				'locale' => 'ja_JP',
+				'currency' => 'JPY',
+				'page' => 3,
+				'per_page' => self::PRODUCT_CARD_COUNT,
+				'sort' => ['field' => 'popularity', 'direction' => 'desc'],
+			],
+		);
+	}
+
+	private static function mixedSerializationDigest(mixed $payload): string
+	{
+		if (!is_array($payload) || !$payload['entity'] instanceof UcBenchSerializeEntity || !$payload['report'] instanceof UcBenchSleepWakeupPayload) {
+			throw new RuntimeException('Mixed serialization payload has an unexpected shape');
+		}
+
+		return sha1($payload['entity']->summary() . '|' . $payload['report']->name . '|' . count($payload['rows']));
+	}
+
+	private static function productListingDigest(mixed $payload): string
+	{
+		if (!$payload instanceof UcBenchProductListingPayload || count($payload->products) !== self::PRODUCT_CARD_COUNT) {
+			throw new RuntimeException('Product listing payload has an unexpected type');
+		}
+		$product = $payload->products[37] ?? null;
+		$facet = $payload->facets['facet_5'][3] ?? null;
+		if (!$product instanceof UcBenchProductCard || !is_array($facet)) {
+			throw new RuntimeException('Product listing payload is incomplete');
+		}
+
+		return $payload->cacheKey . ':' . $payload->generatedAt->format(DATE_ATOM)
+			. ':' . $product->sku . ':' . $product->seller->label
+			. ':' . $facet['value'] . ':' . $payload->context['sort']['field'];
+	}
+
+	private static function mixedSerializationProbe(mixed $payload, int $operation): int
+	{
+		$row = $payload['rows'][$operation % 24] ?? null;
+		if (!is_array($row)) {
+			throw new RuntimeException('Mixed serialization payload is incomplete');
+		}
+
+		return $payload['entity']->summary() + $row['id'] + $payload['config']['limits']['rate'];
+	}
+
+	private static function productListingProbe(mixed $payload, int $operation): int
+	{
+		if (!$payload instanceof UcBenchProductListingPayload) {
+			throw new RuntimeException('Product listing payload has an unexpected type');
+		}
+		$product = $payload->products[($operation * 17) % self::PRODUCT_CARD_COUNT] ?? null;
+		$facet = $payload->facets['facet_' . ($operation % 12)][($operation * 3) % 8] ?? null;
+		if (!$product instanceof UcBenchProductCard || !is_array($facet)) {
+			throw new RuntimeException('Product listing payload is incomplete');
+		}
+
+		return $product->id
+			+ $product->priceCents
+			+ $product->seller->revision
+			+ (int) $facet['count']
+			+ strlen($payload->context['locale']);
+	}
+
 	private static function multiKeyConfigProbe(mixed $payload, int $operation): int
 	{
 		if (!is_array($payload) || !isset($payload['entries'])) {
@@ -1379,7 +1974,7 @@ final class UcBenchPayloadFactory
 
 final class UcBenchRunner
 {
-	private array $backendOrder = ['user_cache', 'apcu', 'deepclone'];
+	private array $backendOrder = ['user_cache', 'apcu', 'apcu_igbinary'];
 
 	public function __construct(private readonly array $options)
 	{
@@ -1450,6 +2045,7 @@ final class UcBenchRunner
 					'label' => $case['label'],
 					'description' => $case['description'],
 					'mutates_after_fetch' => $case['mutate'] !== null,
+					'collects_cycles_after_fetch' => $case['collect_cycles_after_fetch'],
 				],
 				$cases,
 			),
@@ -1502,23 +2098,26 @@ final class UcBenchRunner
 
 	private function runCaseWorkersForMode(array &$result, array $cases, string $mode): void
 	{
+		$backendNames = $this->selectedBackendNames();
 		foreach ($cases as $caseName => $_case) {
-			$workerOutput = tempnam($this->options['results_dir'], 'ucbench-worker-');
-			if ($workerOutput === false) {
-				throw new RuntimeException('Failed to create worker result file in: ' . $this->options['results_dir']);
-			}
+			foreach ($backendNames as $backendName) {
+				$workerOutput = tempnam($this->options['results_dir'], 'ucbench-worker-');
+				if ($workerOutput === false) {
+					throw new RuntimeException('Failed to create worker result file in: ' . $this->options['results_dir']);
+				}
 
-			try {
-				$this->appendWorkerResult($result, $this->runCaseWorker($caseName, $mode, $workerOutput));
-			} finally {
-				if (is_file($workerOutput)) {
-					unlink($workerOutput);
+				try {
+					$this->appendWorkerResult($result, $this->runCaseWorker($caseName, $mode, $workerOutput, $backendName));
+				} finally {
+					if (is_file($workerOutput)) {
+						unlink($workerOutput);
+					}
 				}
 			}
 		}
 	}
 
-	private function runCaseWorker(string $caseName, string $mode, string $workerOutput): array
+	private function runCaseWorker(string $caseName, string $mode, string $workerOutput, string $backendName): array
 	{
 		$workerArgs = [
 			'--no-isolate',
@@ -1536,14 +2135,12 @@ final class UcBenchRunner
 			(string) $this->options['write_operations'],
 			'--key-space',
 			(string) $this->options['key_space'],
+			'--backends',
+			$backendName,
 		];
 		$json = '';
 		$result = null;
 
-		if ($this->options['backends'] !== null) {
-			$workerArgs[] = '--backends';
-			$workerArgs[] = implode(',', $this->options['backends']);
-		}
 		if ($mode === 'write') {
 			$workerArgs[] = '--write-only';
 		} else if ($mode === 'read') {
@@ -1552,7 +2149,7 @@ final class UcBenchRunner
 			throw new InvalidArgumentException('Unknown worker mode: ' . $mode);
 		}
 
-		uc_bench_run_worker_process($workerArgs, $mode . '/' . $caseName);
+		uc_bench_run_worker_process($workerArgs, $mode . '/' . $caseName . '/' . $backendName, $backendName);
 
 		$json = file_get_contents($workerOutput);
 		if ($json === false) {
@@ -1590,11 +2187,7 @@ final class UcBenchRunner
 
 	private function selectBackends(?array $names): array
 	{
-		$all = [
-			'user_cache' => new UcBenchUserCacheBackend('benchmark_user_cache'),
-			'apcu' => new UcBenchApcuBackend(),
-			'deepclone' => new UcBenchDeepCloneBackend(),
-		];
+		$all = $this->allBackends();
 
 		if ($names === null) {
 			$names = $this->backendOrder;
@@ -1609,6 +2202,33 @@ final class UcBenchRunner
 		}
 
 		return $selected;
+	}
+
+	private function selectedBackendNames(): array
+	{
+		$names = $this->options['backends'] ?? $this->backendOrder;
+		$all = $this->allBackends();
+		foreach ($names as $name) {
+			if (!isset($all[$name])) {
+				throw new InvalidArgumentException('Unknown backend: ' . $name);
+			}
+		}
+
+		return $names;
+	}
+
+	private function allBackends(): array
+	{
+		return [
+			'user_cache' => new UcBenchUserCacheBackend('benchmark_user_cache'),
+			'apcu' => new UcBenchApcuBackend(),
+			'apcu_igbinary' => new UcBenchApcuBackend(
+				'apcu_igbinary',
+				'APCu/igbinary store/fetch',
+				'igbinary',
+				true,
+			),
+		];
 	}
 
 	private function measureRead(string $caseName, array $case, UcBenchBackend $backend): array
@@ -1646,21 +2266,36 @@ final class UcBenchRunner
 		$operations = $this->options['read_operations'];
 		$mutate = $case['mutate'];
 		$probe = $case['probe'];
+		$collectCycles = $case['collect_cycles_after_fetch'];
+		$gcWasEnabled = $collectCycles && gc_enabled();
 		$value = null;
 		$readScore = 0;
-		$start = hrtime(true);
 
-		for ($i = 0; $i < $operations; $i++) {
-			$value = $backend->fetch($key);
-			if ($probe !== null) {
-				$readScore ^= $probe($value, $i);
+		if ($gcWasEnabled) {
+			gc_disable();
+		}
+
+		$start = hrtime(true);
+		$elapsed = 0;
+
+		try {
+			for ($i = 0; $i < $operations; $i++) {
+				$value = $backend->fetch($key);
+				if ($probe !== null) {
+					$readScore ^= $probe($value, $i);
+				}
+				if ($mutate !== null) {
+					$mutate($value, $i);
+				}
 			}
-			if ($mutate !== null) {
-				$mutate($value, $i);
+
+			$elapsed = hrtime(true) - $start;
+		} finally {
+			if ($gcWasEnabled) {
+				gc_enable();
 			}
 		}
 
-		$elapsed = hrtime(true) - $start;
 		$this->assertDigest($case, $backend->fetch($key), $expectedDigest, $backend->name(), $caseName);
 		if ($readScore === PHP_INT_MIN) {
 			throw new RuntimeException('Unreachable read score guard was hit');
@@ -1850,7 +2485,7 @@ final class UcBenchRunner
 			'loaded_extensions' => [
 				'zend_opcache' => extension_loaded('Zend OPcache') || function_exists('opcache_get_status'),
 				'apcu' => extension_loaded('apcu'),
-				'deepclone' => function_exists('deepclone_to_array') && function_exists('deepclone_from_array'),
+				'igbinary' => function_exists('igbinary_serialize') && function_exists('igbinary_unserialize'),
 			],
 			'ini' => [
 				'opcache.enable' => ini_get('opcache.enable'),
@@ -2027,14 +2662,6 @@ p {
 }
 .neutral {
   color: var(--muted);
-}
-.ranking {
-  display: grid;
-  gap: 3px;
-  font-variant-numeric: tabular-nums;
-}
-.ranking span {
-  white-space: nowrap;
 }
 .score {
   display: block;
@@ -2218,9 +2845,12 @@ summary {
 			}
 		}
 
-		$html = '<h3>' . self::h($title) . '</h3><table><thead><tr>'
-			. '<th>Workload</th><th class="num">UserCache</th><th class="num">APCu</th><th class="num">APCu + DeepClone</th>'
-			. '</tr></thead><tbody>';
+		$backendNames = self::comparisonBackendOrder($rows, $modeFailures);
+		$html = '<h3>' . self::h($title) . '</h3><table><thead><tr><th>Workload</th>';
+		foreach ($backendNames as $backendName) {
+			$html .= '<th class="num">' . self::h(self::backendName($backendName)) . '</th>';
+		}
+		$html .= '<th class="num">Faster/UserCache</th></tr></thead><tbody>';
 
 		foreach ($groups as $caseName => $caseRows) {
 			$best = self::bestRow($caseRows, $metricName);
@@ -2230,15 +2860,46 @@ summary {
 				?? $caseName;
 
 			$html .= '<tr><td><code>' . self::h($caseName) . '</code><br>' . self::h($caseLabel)
-				. '</td><td class="num">' . self::scoreCell(self::rowForBackend($caseRows, 'user_cache'), $modeFailures[$caseName]['user_cache'] ?? null, $bestValue, $metricName)
-				. '</td><td class="num">' . self::scoreCell(self::rowForBackend($caseRows, 'apcu'), $modeFailures[$caseName]['apcu'] ?? null, $bestValue, $metricName)
-				. '</td><td class="num">' . self::scoreCell(self::rowForBackend($caseRows, 'deepclone'), $modeFailures[$caseName]['deepclone'] ?? null, $bestValue, $metricName)
-				. '</td></tr>';
+				. '</td>';
+			foreach ($backendNames as $backendName) {
+				$html .= '<td class="num">' . self::scoreCell(self::rowForBackend($caseRows, $backendName), $modeFailures[$caseName][$backendName] ?? null, $bestValue, $metricName)
+					. '</td>';
+			}
+			$html .= '<td class="num">' . self::fasterVsUserCacheCell($caseRows, $metricName) . '</td></tr>';
 		}
 
 		$html .= '</tbody></table>';
 
 		return $html;
+	}
+
+	private static function comparisonBackendOrder(array $rows, array $modeFailures): array
+	{
+		$preferred = ['user_cache', 'apcu', 'apcu_igbinary'];
+		$seen = [];
+		foreach ($rows as $row) {
+			if (isset($row['backend'])) {
+				$seen[(string) $row['backend']] = true;
+			}
+		}
+		foreach ($modeFailures as $backendFailures) {
+			foreach ($backendFailures as $backendName => $_failure) {
+				$seen[(string) $backendName] = true;
+			}
+		}
+
+		$ordered = [];
+		foreach ($preferred as $backendName) {
+			if (isset($seen[$backendName])) {
+				$ordered[] = $backendName;
+				unset($seen[$backendName]);
+			}
+		}
+		foreach (array_keys($seen) as $backendName) {
+			$ordered[] = $backendName;
+		}
+
+		return $ordered;
 	}
 
 	private static function scoreCell(?array $row, ?array $failure, ?float $bestValue, string $metricName): string
@@ -2259,6 +2920,23 @@ summary {
 
 		return '<span class="score' . $class . '">' . self::h(self::formatScore($score))
 			. ' (' . self::formatMs($value) . ')</span>';
+	}
+
+	private static function fasterVsUserCacheCell(array $caseRows, string $metricName): string
+	{
+		$userCache = self::rowForBackend($caseRows, 'user_cache');
+		$best = self::bestRow($caseRows, $metricName);
+		if ($userCache === null || $best === null) {
+			return '<span class="score-note">n/a</span>';
+		}
+
+		$userValue = (float) $userCache[$metricName];
+		$bestValue = (float) $best[$metricName];
+		if ($userValue <= 0.0 || $bestValue <= 0.0) {
+			return '<span class="score-note">n/a</span>';
+		}
+
+		return '<span class="score">' . self::h(self::number($userValue / $bestValue, 2) . 'x (' . self::backendName((string) $best['backend']) . ')') . '</span>';
 	}
 
 	private static function failuresByCaseAndBackend(array $failures, string $mode): array
@@ -2283,85 +2961,6 @@ summary {
 		}
 
 		return null;
-	}
-
-	private static function winnerCell(?array $row, string $metricName): string
-	{
-		if ($row === null) {
-			return 'n/a';
-		}
-
-		return '<span class="backend-chip winner-chip">' . self::h(self::backendName($row['backend'])) . '</span>'
-			. '<span class="relation neutral">' . self::h(self::formatUs((float) $row[$metricName])) . '</span>';
-	}
-
-	private static function userCacheCell(?array $userCache, ?array $best, string $metricName): string
-	{
-		if ($userCache === null) {
-			return '<span class="neutral">n/a</span>';
-		}
-
-		$value = (float) $userCache[$metricName];
-		$relation = 'winner';
-		$class = 'faster';
-		if ($best !== null && $best['backend'] !== 'user_cache') {
-			$relation = self::number($value / (float) $best[$metricName], 2) . 'x slower than winner';
-			$class = 'slower';
-		}
-
-		return '<strong>' . self::h(self::formatUs($value)) . '</strong>'
-			. '<span class="relation ' . $class . '">' . self::h($relation) . '</span>';
-	}
-
-	private static function backendVsUserCacheCell(?array $backend, ?array $userCache, string $metricName): string
-	{
-		if ($backend === null) {
-			return '<span class="neutral">not measured</span>';
-		}
-
-		$value = (float) $backend[$metricName];
-		if ($userCache === null) {
-			return '<strong>' . self::h(self::formatUs($value)) . '</strong>'
-				. '<span class="relation neutral">UserCache not measured</span>';
-		}
-
-		$userCacheValue = (float) $userCache[$metricName];
-		$delta = $userCacheValue > 0.0 ? (($value - $userCacheValue) / $userCacheValue) * 100.0 : null;
-		$class = 'neutral';
-		$relation = 'same as UserCache';
-		if ($userCacheValue > 0.0 && !self::aboutSameRatio($value, $userCacheValue)) {
-			if ($value < $userCacheValue) {
-				$class = 'faster';
-				$relation = self::number($userCacheValue / $value, 2) . 'x faster than UserCache';
-			} else {
-				$class = 'slower';
-				$relation = self::number($value / $userCacheValue, 2) . 'x slower than UserCache';
-			}
-			if ($delta !== null) {
-				$relation .= ' (' . self::signedPercent($delta) . ')';
-			}
-		} elseif ($delta !== null && abs($delta) >= 0.005) {
-			$relation = 'about same as UserCache (' . self::signedPercent($delta) . ')';
-		}
-
-		return '<strong>' . self::h(self::formatUs($value)) . '</strong>'
-			. '<span class="relation ' . $class . '">' . self::h($relation) . '</span>';
-	}
-
-	private static function rankingCell(array $rows, string $metricName): string
-	{
-		usort($rows, static fn (array $a, array $b): int => $a[$metricName] <=> $b[$metricName]);
-
-		$html = '<div class="ranking">';
-		foreach ($rows as $rank => $row) {
-			$class = $rank === 0 ? 'winner-chip' : '';
-			$html .= '<span><span class="backend-chip ' . $class . '">' . ($rank + 1) . '. '
-				. self::h(self::backendName($row['backend'])) . '</span> '
-				. self::h(self::formatUs((float) $row[$metricName])) . '</span>';
-		}
-		$html .= '</div>';
-
-		return $html;
 	}
 
 	private static function groupRowsByCase(array $rows): array
@@ -2580,7 +3179,7 @@ summary {
 		return match ($backend) {
 			'user_cache' => 'UserCache',
 			'apcu' => 'APCu',
-			'deepclone' => 'APCu + DeepClone',
+			'apcu_igbinary' => 'APCu/igbinary',
 			default => $backend,
 		};
 	}
@@ -2612,15 +3211,6 @@ summary {
 		}
 
 		return substr($error, 0, 117) . '...';
-	}
-
-	private static function aboutSameRatio(float $a, float $b): bool
-	{
-		if ($a <= 0.0 || $b <= 0.0) {
-			return false;
-		}
-
-		return max($a, $b) / min($a, $b) < 1.01;
 	}
 
 	private static function signedPercent(float $value): string
@@ -2657,7 +3247,7 @@ Options:
   --write-operations N      Store operations per measured write iteration. Default: 1000
   --key-space N             Distinct write keys per case/backend. Default: 32
   --cases a,b,c             Comma-separated payload cases.
-  --backends a,b,c          Comma-separated backends: user_cache,apcu,deepclone.
+  --backends a,b,c          Comma-separated backends: user_cache,apcu,apcu_igbinary.
   --read-only               Run read benchmarks only.
   --write-only              Run write benchmarks only.
   --no-write                Alias for --read-only.
@@ -2829,7 +3419,38 @@ function uc_bench_worker_php_args(): array
 	return array_values($args);
 }
 
-function uc_bench_run_worker_process(array $workerArgs, string $caseName): void
+function uc_bench_backend_php_args(?string $backendName): array
+{
+	if ($backendName === null) {
+		return [];
+	}
+
+	$json = getenv('UC_BENCH_BACKEND_PHP_ARGS_JSON');
+	if ($json === false || $json === '') {
+		return [];
+	}
+
+	$config = json_decode($json, true, 512, JSON_THROW_ON_ERROR);
+	if (!is_array($config)) {
+		throw new RuntimeException('UC_BENCH_BACKEND_PHP_ARGS_JSON must contain a JSON object');
+	}
+	if (!isset($config[$backendName])) {
+		return [];
+	}
+	if (!is_array($config[$backendName])) {
+		throw new RuntimeException('UC_BENCH_BACKEND_PHP_ARGS_JSON values must be JSON arrays');
+	}
+
+	foreach ($config[$backendName] as $arg) {
+		if (!is_string($arg)) {
+			throw new RuntimeException('UC_BENCH_BACKEND_PHP_ARGS_JSON arrays must contain only string arguments');
+		}
+	}
+
+	return array_values($config[$backendName]);
+}
+
+function uc_bench_run_worker_process(array $workerArgs, string $caseName, ?string $backendName = null): void
 {
 	$stdoutPath = tempnam(sys_get_temp_dir(), 'ucbench-out-');
 	$stderrPath = tempnam(sys_get_temp_dir(), 'ucbench-err-');
@@ -2846,7 +3467,7 @@ function uc_bench_run_worker_process(array $workerArgs, string $caseName): void
 	}
 
 	try {
-		$command = array_merge([PHP_BINARY], uc_bench_worker_php_args(), [__FILE__], $workerArgs);
+		$command = array_merge([PHP_BINARY], uc_bench_worker_php_args(), uc_bench_backend_php_args($backendName), [__FILE__], $workerArgs);
 		$descriptors = [
 			0 => ['pipe', 'r'],
 			1 => ['file', $stdoutPath, 'w'],

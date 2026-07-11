@@ -20,7 +20,7 @@ final class UserCacheFpmReadRunner
 		'carbon_datetime_object',
 		'carbon_model_object',
 	];
-	private array $backends = ['user_cache', 'apcu', 'deepclone'];
+	private array $backends = ['user_cache', 'apcu', 'apcu_igbinary'];
 	private int $operations = 1;
 	private int $requests = 60;
 	private int $warmup = 10;
@@ -41,6 +41,11 @@ final class UserCacheFpmReadRunner
 		$failures = [];
 
 		foreach ($this->cases as $caseName) {
+			$activeBackends = [];
+			$digests = [];
+			$samplesByBackend = [];
+			$remainingByBackend = [];
+
 			foreach ($this->backends as $backendName) {
 				try {
 					$prime = $this->requestJson([
@@ -57,8 +62,10 @@ final class UserCacheFpmReadRunner
 						$this->runMeasureRequests($caseName, $backendName, $digest, $this->warmup);
 					}
 
-					$samples = $this->runMeasureRequests($caseName, $backendName, $digest, $this->requests);
-					$results[] = $this->summarize($caseName, $backendName, $samples);
+					$activeBackends[] = $backendName;
+					$digests[$backendName] = $digest;
+					$samplesByBackend[$backendName] = [];
+					$remainingByBackend[$backendName] = $this->requests;
 				} catch (Throwable $throwable) {
 					$failures[] = [
 						'case' => $caseName,
@@ -66,6 +73,45 @@ final class UserCacheFpmReadRunner
 						'error_class' => $throwable::class,
 						'error' => $throwable->getMessage(),
 					];
+				}
+			}
+
+			while (true) {
+				$hadWork = false;
+				foreach ($activeBackends as $backendName) {
+					if (($remainingByBackend[$backendName] ?? 0) <= 0) {
+						continue;
+					}
+
+					$hadWork = true;
+					$requestCount = min($this->concurrency, $remainingByBackend[$backendName]);
+					try {
+						array_push(
+							$samplesByBackend[$backendName],
+							...$this->runMeasureRequests($caseName, $backendName, $digests[$backendName], $requestCount),
+						);
+						$remainingByBackend[$backendName] -= $requestCount;
+					} catch (Throwable $throwable) {
+						$failures[] = [
+							'case' => $caseName,
+							'backend' => $backendName,
+							'error_class' => $throwable::class,
+							'error' => $throwable->getMessage(),
+						];
+						unset($samplesByBackend[$backendName]);
+						$remainingByBackend[$backendName] = 0;
+					}
+				}
+
+				if (!$hadWork) {
+					break;
+				}
+			}
+
+			foreach ($this->backends as $backendName) {
+				if (isset($samplesByBackend[$backendName]) && count($samplesByBackend[$backendName]) === $this->requests) {
+					$results[] = $this->summarize($caseName, $backendName, $samplesByBackend[$backendName]);
+					$this->collectCycles($caseName, $backendName);
 				}
 			}
 		}
@@ -137,7 +183,7 @@ final class UserCacheFpmReadRunner
 
 	private function usage(): void
 	{
-		fwrite(STDOUT, "Usage: php scripts/benchmark_user_cache_fpm_read.php [--base-url URL] [--cases a,b] [--backends user_cache,apcu,deepclone] [--operations N] [--requests N] [--warmup N] [--concurrency N] [--hold-us N] [--output FILE]\n");
+		fwrite(STDOUT, "Usage: php scripts/benchmark_user_cache_fpm_read.php [--base-url URL] [--cases a,b] [--backends user_cache,apcu,apcu_igbinary] [--operations N] [--requests N] [--warmup N] [--concurrency N] [--hold-us N] [--output FILE]\n");
 	}
 
 	private function runMeasureRequests(string $caseName, string $backendName, string $digest, int $requestCount): array
@@ -165,6 +211,23 @@ final class UserCacheFpmReadRunner
 		}
 
 		return $samples;
+	}
+
+	private function collectCycles(string $caseName, string $backendName): void
+	{
+		$batch = [];
+		for ($i = 0; $i < $this->concurrency; $i++) {
+			$batch[] = $this->startCurl($this->url([
+				'action' => 'collect_cycles',
+				'case' => $caseName,
+				'backend' => $backendName,
+				'hold_us' => '1000',
+			]));
+		}
+
+		foreach ($batch as $process) {
+			$this->finishCurl($process);
+		}
 	}
 
 	private function startCurl(string $url): array
@@ -214,8 +277,15 @@ final class UserCacheFpmReadRunner
 		$serverUs = array_map(static fn (array $sample): float => (float) $sample['server_us_per_op'], $samples);
 		$clientUs = array_map(static fn (array $sample): float => (float) $sample['client_us'], $samples);
 		$pids = [];
+		$workerServerUs = [];
 		foreach ($samples as $sample) {
-			$pids[(string) $sample['pid']] = ($pids[(string) $sample['pid']] ?? 0) + 1;
+			$pid = (string) $sample['pid'];
+			$pids[$pid] = ($pids[$pid] ?? 0) + 1;
+			$workerServerUs[$pid][] = (float) $sample['server_us_per_op'];
+		}
+		$workerMedians = [];
+		foreach ($workerServerUs as $pid => $values) {
+			$workerMedians[$pid] = $this->median($values);
 		}
 
 		return [
@@ -225,9 +295,14 @@ final class UserCacheFpmReadRunner
 			'requests' => count($samples),
 			'mean_server_us_per_op' => $this->mean($serverUs),
 			'median_server_us_per_op' => $this->median($serverUs),
+			'p25_server_us_per_op' => $this->percentile($serverUs, 0.25),
+			'p75_server_us_per_op' => $this->percentile($serverUs, 0.75),
+			'p95_server_us_per_op' => $this->percentile($serverUs, 0.95),
 			'min_server_us_per_op' => min($serverUs),
 			'max_server_us_per_op' => max($serverUs),
 			'mean_client_us_per_request' => $this->mean($clientUs),
+			'median_worker_median_server_us_per_op' => $this->median(array_values($workerMedians)),
+			'worker_median_server_us_per_op' => $workerMedians,
 			'worker_pids' => $pids,
 			'worker_count' => count($pids),
 		];
@@ -360,6 +435,29 @@ final class UserCacheFpmReadRunner
 		}
 
 		return ((float) $values[$middle - 1] + (float) $values[$middle]) / 2.0;
+	}
+
+	private function percentile(array $values, float $percentile): float
+	{
+		sort($values, SORT_NUMERIC);
+		$count = count($values);
+		if ($count === 0) {
+			return 0.0;
+		}
+		if ($count === 1) {
+			return (float) $values[0];
+		}
+
+		$rank = ($count - 1) * $percentile;
+		$lower = (int) floor($rank);
+		$upper = (int) ceil($rank);
+		if ($lower === $upper) {
+			return (float) $values[$lower];
+		}
+
+		$weight = $rank - $lower;
+
+		return ((float) $values[$lower] * (1.0 - $weight)) + ((float) $values[$upper] * $weight);
 	}
 }
 

@@ -2,18 +2,19 @@
 
 set -eu
 
-PHPIZE=${1:?usage: build_deepclone.sh /path/to/phpize /path/to/php-config /path/to/output-dir optional-work-dir}
-PHP_CONFIG=${2:?usage: build_deepclone.sh /path/to/phpize /path/to/php-config /path/to/output-dir optional-work-dir}
-OUTPUT_DIR=${3:?usage: build_deepclone.sh /path/to/phpize /path/to/php-config /path/to/output-dir optional-work-dir}
+PHPIZE=${1:?usage: build_igbinary.sh /path/to/phpize /path/to/php-config /path/to/output-dir optional-work-dir}
+PHP_CONFIG=${2:?usage: build_igbinary.sh /path/to/phpize /path/to/php-config /path/to/output-dir optional-work-dir}
+OUTPUT_DIR=${3:?usage: build_igbinary.sh /path/to/phpize /path/to/php-config /path/to/output-dir optional-work-dir}
 WORK_DIR=${4:-${OUTPUT_DIR}/build-src}
-DEEPCLONE_VERSION=${DEEPCLONE_VERSION:-v0.8.1}
-DEEPCLONE_REPO=${DEEPCLONE_REPO:-https://github.com/symfony/php-ext-deepclone.git}
+IGBINARY_VERSION=${IGBINARY_VERSION:-master}
+IGBINARY_REPO=${IGBINARY_REPO:-https://github.com/igbinary/igbinary.git}
 SCRIPT_DIR=$(CDPATH= cd "$(dirname "${0}")" && pwd)
 SOURCE_ROOT=$(CDPATH= cd "${SCRIPT_DIR}/../.." && pwd)
 BUILD_ROOT=$(CDPATH= cd "$(dirname "${PHPIZE}")/.." && pwd)
 STAGE_PREFIX=${OUTPUT_DIR}/php-prefix
 WRAPPER_PHPIZE=${OUTPUT_DIR}/phpize
 WRAPPER_PHP_CONFIG=${OUTPUT_DIR}/php-config
+APCU_SOURCE_DIR=${APCU_SOURCE_DIR:-$(CDPATH= cd "${OUTPUT_DIR}/../apcu/build-src" 2>/dev/null && pwd || true)}
 EXTRA_CPPFLAGS=${CPPFLAGS:-}
 EXTRA_CFLAGS=${CFLAGS:-}
 MAKE_JOBS=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
@@ -22,11 +23,19 @@ mkdir -p "${OUTPUT_DIR}"
 chmod u+x "${PHPIZE}" "${PHP_CONFIG}"
 
 rm -rf "${STAGE_PREFIX}"
-mkdir -p "${STAGE_PREFIX}/bin" "${STAGE_PREFIX}/include/php" "${STAGE_PREFIX}/lib/php/build"
+mkdir -p "${STAGE_PREFIX}/bin" "${STAGE_PREFIX}/include/php/ext" "${STAGE_PREFIX}/lib/php/build"
 cp -a "${SOURCE_ROOT}/main" "${STAGE_PREFIX}/include/php/"
 cp -a "${SOURCE_ROOT}/TSRM" "${STAGE_PREFIX}/include/php/"
 cp -a "${SOURCE_ROOT}/Zend" "${STAGE_PREFIX}/include/php/"
-ln -s "${SOURCE_ROOT}/ext" "${STAGE_PREFIX}/include/php/ext"
+for EXT_DIR in "${SOURCE_ROOT}"/ext/*; do
+	if test -e "${EXT_DIR}"; then
+		ln -s "${EXT_DIR}" "${STAGE_PREFIX}/include/php/ext/$(basename "${EXT_DIR}")"
+	fi
+done
+if test -n "${APCU_SOURCE_DIR}" && test -f "${APCU_SOURCE_DIR}/apc_serializer.h"; then
+	rm -f "${STAGE_PREFIX}/include/php/ext/apcu"
+	ln -s "${APCU_SOURCE_DIR}" "${STAGE_PREFIX}/include/php/ext/apcu"
+fi
 cp -a "${BUILD_ROOT}/main/php_config.h" "${STAGE_PREFIX}/include/php/main/php_config.h"
 cp -a "${BUILD_ROOT}/main/build-defs.h" "${STAGE_PREFIX}/include/php/main/build-defs.h"
 cp -a "${BUILD_ROOT}/Zend/zend_config.h" "${STAGE_PREFIX}/include/php/Zend/zend_config.h"
@@ -53,7 +62,7 @@ chmod u+x "${WRAPPER_PHP_CONFIG}"
 
 if test ! -d "${WORK_DIR}/.git"; then
 	rm -rf "${WORK_DIR}"
-	git clone --depth 1 --branch "${DEEPCLONE_VERSION}" "${DEEPCLONE_REPO}" "${WORK_DIR}"
+	git clone --depth 1 --branch "${IGBINARY_VERSION}" "${IGBINARY_REPO}" "${WORK_DIR}"
 fi
 
 cd "${WORK_DIR}"
@@ -65,8 +74,8 @@ if grep -q '^#define ZTS 1' "${BUILD_ROOT}/main/php_config.h"; then
 	EXTRA_CFLAGS="${EXTRA_CFLAGS} -DZTS=1"
 fi
 "${WRAPPER_PHPIZE}"
-CPPFLAGS="${EXTRA_CPPFLAGS}" CFLAGS="${EXTRA_CFLAGS}" ./configure --with-php-config="${WRAPPER_PHP_CONFIG}" --enable-deepclone
+CPPFLAGS="${EXTRA_CPPFLAGS}" CFLAGS="${EXTRA_CFLAGS}" ./configure --with-php-config="${WRAPPER_PHP_CONFIG}" --enable-igbinary
 make -j"${MAKE_JOBS}"
-cp modules/deepclone.so "${OUTPUT_DIR}/deepclone.so"
+cp modules/igbinary.so "${OUTPUT_DIR}/igbinary.so"
 
-printf '%s\n' "${OUTPUT_DIR}/deepclone.so"
+printf '%s\n' "${OUTPUT_DIR}/igbinary.so"
